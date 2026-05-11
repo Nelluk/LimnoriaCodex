@@ -1,0 +1,33 @@
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test and type/lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Coverage outputs
+.coverage
+.coverage.*
+htmlcov/
+
+# Packaging/build artifacts
+build/
+dist/
+.eggs/
+*.egg-info/
+
+# Local/private agent and runtime files
+AGENTS.md
+.agents/
+.codex
+backup/
+conf/
+data/
+logs/
+tmp/
+
+# Local editor/OS noise
+.DS_Store
