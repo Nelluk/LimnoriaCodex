@@ -47,6 +47,9 @@ class Codex(callbacks.Plugin):
     HIGH_WEB_SEARCH_CONTEXT_SIZE = "high"
     CONTEXT_LINE_CHARS = 200
     LONG_CONTEXT_LINES = 1000
+    LONG_CONTEXT_TIME_FORMAT = "%H:%M"
+    LONG_CONTEXT_MARKER_FORMAT = "%Y-%m-%d %H:00 local"
+    MEMORY_TIME_FORMAT = "%Y-%m-%d %H:%M"
     MAX_REPLY_CHARS = 1200
     MEMORY_MAX_AGE_HOURS = 72
     MEMORY_MAX_CHARS_PER_ENTRY = 280
@@ -398,7 +401,15 @@ class Codex(callbacks.Plugin):
             entries = self._prune_memory_entries(context_state.get("entries", []))
             context_state["entries"] = entries
 
-        return [f"Q: {entry['query']} | A: {entry['reply']}" for entry in entries]
+        lines = []
+        for entry in entries:
+            ts = entry.get("ts")
+            if isinstance(ts, (int, float)):
+                prefix = time.strftime(self.MEMORY_TIME_FORMAT, time.localtime(ts))
+                lines.append(f"[{prefix}] Q: {entry['query']} | A: {entry['reply']}")
+            else:
+                lines.append(f"Q: {entry['query']} | A: {entry['reply']}")
+        return lines
 
     def _clear_memory_context(self, context_key):
         with self._memory_lock:
@@ -452,7 +463,7 @@ class Codex(callbacks.Plugin):
             buf.popleft()
 
         long_buf = self._long_context_buffers[channel]
-        long_buf.append(entry)
+        long_buf.append({"ts": float(time.time()), "text": entry})
         while len(long_buf) > self.LONG_CONTEXT_LINES:
             long_buf.popleft()
 
@@ -471,7 +482,35 @@ class Codex(callbacks.Plugin):
         buffered = list(self._long_context_buffers.get(channel, ()))
         if len(buffered) > self.LONG_CONTEXT_LINES:
             buffered = buffered[-self.LONG_CONTEXT_LINES:]
-        return buffered
+        return self._format_long_context_lines(buffered)
+
+    def _format_long_context_lines(self, buffered):
+        lines = []
+        last_marker = None
+        for item in buffered:
+            if isinstance(item, dict):
+                text = item.get("text", "")
+                ts = item.get("ts")
+            else:
+                text = str(item)
+                ts = None
+
+            text = self._sanitize_context_text(text)
+            if not text:
+                continue
+
+            if isinstance(ts, (int, float)):
+                local_time = time.localtime(ts)
+                marker_key = (local_time.tm_year, local_time.tm_yday, local_time.tm_hour)
+                if marker_key != last_marker:
+                    marker = time.strftime(self.LONG_CONTEXT_MARKER_FORMAT, local_time)
+                    lines.append(f"=== {marker} ===")
+                    last_marker = marker_key
+                prefix = time.strftime(self.LONG_CONTEXT_TIME_FORMAT, local_time)
+                lines.append(f"[{prefix}] {text}")
+            else:
+                lines.append(text)
+        return lines
 
     def _build_stateless_prompt(self, channel, query, mode=MODE_NORMAL):
         mode = self._normalized_mode(mode)

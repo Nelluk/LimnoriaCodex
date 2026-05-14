@@ -88,8 +88,8 @@ Behavior summary:
 - Each request is stateless.
 - Recent channel or private-message context is included as untrusted context.
 - `@codexhigh` uses a higher-effort Codex preset.
-- `@codexlong` uses a larger in-memory transcript buffer for channel analysis.
-- Optional persistent memory stores successful Codex command query/reply pairs per context.
+- `@codexlong` uses a larger in-memory transcript buffer for channel analysis, with local hour markers and per-line times.
+- Optional persistent memory stores timestamped successful Codex command query/reply pairs per context.
 - Output is sanitized for IRC by stripping markdown, links, control characters, and excess formatting.
 - Only one Codex request runs at a time; concurrent requests are rejected as busy.
 
@@ -111,6 +111,7 @@ Operational defaults in `plugin.py`:
 - `@codexhigh` reasoning effort: `medium`
 - `@codexhigh` web search context size: `high`
 - `@codexlong` context size: 1000 captured lines.
+- `@codexlong` context time format: hourly local markers plus `[HH:MM]` line prefixes.
 - Captured IRC line cap: 200 chars per line.
 - Reply cap: 1200 chars total.
 - Memory age cap: 72 hours.

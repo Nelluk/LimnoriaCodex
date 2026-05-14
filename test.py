@@ -5,6 +5,7 @@ import os
 import shutil
 import threading
 import tempfile
+import time
 import types
 import unittest
 from collections import defaultdict, deque
@@ -12,6 +13,7 @@ from pathlib import Path
 from subprocess import TimeoutExpired
 from unittest import mock
 
+from . import plugin as codex_plugin
 from .plugin import Codex, WrapperExecutionError, WrapperTimeoutError
 
 
@@ -147,8 +149,10 @@ class CodexPluginUnitTest(unittest.TestCase):
 
     def test_long_mode_uses_long_prompt_and_high_wrapper_mode(self):
         self.plugin._config["maxContextLines"] = 1
-        self.plugin.doPrivmsg(self.irc, FakeMsg("alice", "#test", "first long detail"))
-        self.plugin.doPrivmsg(self.irc, FakeMsg("bob", "#test", "second long detail"))
+        timestamp = time.mktime((2026, 5, 13, 20, 3, 0, 0, 0, -1))
+        with mock.patch.object(codex_plugin.time, "time", return_value=timestamp):
+            self.plugin.doPrivmsg(self.irc, FakeMsg("alice", "#test", "first long detail"))
+            self.plugin.doPrivmsg(self.irc, FakeMsg("bob", "#test", "second long detail"))
 
         with mock.patch.object(self.plugin, "_invoke_wrapper", return_value="Answer") as wrapped:
             self.plugin._handle_codex_request(
@@ -163,8 +167,9 @@ class CodexPluginUnitTest(unittest.TestCase):
         self.assertEqual(wrapped.call_args.args[2], 90)
         self.assertEqual(wrapped.call_args.kwargs["mode"], "high")
         self.assertIn("long-context transcript analysis request", full_prompt)
-        self.assertIn("alice: first long detail", full_prompt)
-        self.assertIn("bob: second long detail", full_prompt)
+        self.assertIn("=== 2026-05-13 20:00 local ===", full_prompt)
+        self.assertIn("[20:03] alice: first long detail", full_prompt)
+        self.assertIn("[20:03] bob: second long detail", full_prompt)
         self.assertIn("Do not use live web search unless", full_prompt)
         self.assertNotIn("Default to up-to-date answers", full_prompt)
 
@@ -264,9 +269,11 @@ class CodexPluginUnitTest(unittest.TestCase):
         self.plugin._config["maxContextLines"] = 2
         self.plugin.LONG_CONTEXT_LINES = 4
         chan = "#test"
+        timestamp = time.mktime((2026, 5, 13, 20, 3, 0, 0, 0, -1))
 
-        for idx in range(1, 7):
-            self.plugin.doPrivmsg(self.irc, FakeMsg(f"user{idx}", chan, f"line {idx}"))
+        with mock.patch.object(codex_plugin.time, "time", return_value=timestamp):
+            for idx in range(1, 7):
+                self.plugin.doPrivmsg(self.irc, FakeMsg(f"user{idx}", chan, f"line {idx}"))
 
         self.assertEqual(
             self.plugin._get_context_lines(chan),
@@ -274,7 +281,32 @@ class CodexPluginUnitTest(unittest.TestCase):
         )
         self.assertEqual(
             self.plugin._get_long_context_lines(chan),
-            ["user3: line 3", "user4: line 4", "user5: line 5", "user6: line 6"],
+            [
+                "=== 2026-05-13 20:00 local ===",
+                "[20:03] user3: line 3",
+                "[20:03] user4: line 4",
+                "[20:03] user5: line 5",
+                "[20:03] user6: line 6",
+            ],
+        )
+
+    def test_long_context_adds_new_marker_when_hour_changes(self):
+        first = time.mktime((2026, 5, 13, 23, 59, 0, 0, 0, -1))
+        second = time.mktime((2026, 5, 14, 0, 1, 0, 0, 0, -1))
+
+        self.assertEqual(
+            self.plugin._format_long_context_lines(
+                [
+                    {"ts": first, "text": "alice: before midnight"},
+                    {"ts": second, "text": "bob: after midnight"},
+                ]
+            ),
+            [
+                "=== 2026-05-13 23:00 local ===",
+                "[23:59] alice: before midnight",
+                "=== 2026-05-14 00:00 local ===",
+                "[00:01] bob: after midnight",
+            ],
         )
 
     def test_private_message_context_capture(self):
@@ -295,36 +327,40 @@ class CodexPluginUnitTest(unittest.TestCase):
 
     def test_persistent_memory_prompt_includes_successful_prior_exchange(self):
         self.plugin._config["persistentMemoryEnabled"] = True
+        timestamp = time.mktime((2026, 5, 13, 20, 3, 0, 0, 0, -1))
 
-        with mock.patch.object(self.plugin, "_invoke_wrapper", return_value="First answer"):
-            self.plugin._handle_codex_request(self.irc, self.msg, "first question?")
+        with mock.patch.object(codex_plugin.time, "time", return_value=timestamp):
+            with mock.patch.object(self.plugin, "_invoke_wrapper", return_value="First answer"):
+                self.plugin._handle_codex_request(self.irc, self.msg, "first question?")
 
-        with mock.patch.object(
-            self.plugin,
-            "_invoke_wrapper",
-            return_value="Second answer",
-        ) as wrapped:
-            self.plugin._handle_codex_request(self.irc, self.msg, "second question?")
+            with mock.patch.object(
+                self.plugin,
+                "_invoke_wrapper",
+                return_value="Second answer",
+            ) as wrapped:
+                self.plugin._handle_codex_request(self.irc, self.msg, "second question?")
 
         second_prompt = wrapped.call_args.args[1]
         self.assertIn("RECENT CODEX EXCHANGES", second_prompt)
-        self.assertIn("Q: first question? | A: First answer", second_prompt)
+        self.assertIn("[2026-05-13 20:03] Q: first question? | A: First answer", second_prompt)
         self.assertTrue(os.path.isfile(self.plugin._memory_path))
 
     def test_long_mode_records_successful_exchange_in_memory(self):
         self.plugin._config["persistentMemoryEnabled"] = True
+        timestamp = time.mktime((2026, 5, 13, 20, 3, 0, 0, 0, -1))
 
-        with mock.patch.object(self.plugin, "_invoke_wrapper", return_value="Long answer"):
-            self.plugin._handle_codex_request(
-                self.irc,
-                self.msg,
-                "long question?",
-                mode="long",
-            )
+        with mock.patch.object(codex_plugin.time, "time", return_value=timestamp):
+            with mock.patch.object(self.plugin, "_invoke_wrapper", return_value="Long answer"):
+                self.plugin._handle_codex_request(
+                    self.irc,
+                    self.msg,
+                    "long question?",
+                    mode="long",
+                )
 
         self.assertEqual(
             self.plugin._memory_lines_for_prompt("#test"),
-            ["Q: long question? | A: Long answer"],
+            ["[2026-05-13 20:03] Q: long question? | A: Long answer"],
         )
 
     def test_persistent_memory_orders_by_reserved_sequence(self):
@@ -334,12 +370,16 @@ class CodexPluginUnitTest(unittest.TestCase):
         seq_one = self.plugin._reserve_memory_sequence(context)
         seq_two = self.plugin._reserve_memory_sequence(context)
 
-        self.plugin._record_persistent_exchange(context, "q2", "a2", seq_two)
-        self.plugin._record_persistent_exchange(context, "q1", "a1", seq_one)
+        first = time.mktime((2026, 5, 13, 20, 1, 0, 0, 0, -1))
+        second = time.mktime((2026, 5, 13, 20, 2, 0, 0, 0, -1))
+        with mock.patch.object(codex_plugin.time, "time", return_value=second):
+            self.plugin._record_persistent_exchange(context, "q2", "a2", seq_two)
+        with mock.patch.object(codex_plugin.time, "time", return_value=first):
+            self.plugin._record_persistent_exchange(context, "q1", "a1", seq_one)
 
         self.assertEqual(
             self.plugin._memory_lines_for_prompt(context),
-            ["Q: q1 | A: a1", "Q: q2 | A: a2"],
+            ["[2026-05-13 20:01] Q: q1 | A: a1", "[2026-05-13 20:02] Q: q2 | A: a2"],
         )
 
     def test_persistent_memory_prunes_to_max_exchanges(self):
@@ -351,13 +391,19 @@ class CodexPluginUnitTest(unittest.TestCase):
         seq_two = self.plugin._reserve_memory_sequence(context)
         seq_three = self.plugin._reserve_memory_sequence(context)
 
-        self.plugin._record_persistent_exchange(context, "q1", "a1", seq_one)
-        self.plugin._record_persistent_exchange(context, "q2", "a2", seq_two)
-        self.plugin._record_persistent_exchange(context, "q3", "a3", seq_three)
+        first = time.mktime((2026, 5, 13, 20, 1, 0, 0, 0, -1))
+        second = time.mktime((2026, 5, 13, 20, 2, 0, 0, 0, -1))
+        third = time.mktime((2026, 5, 13, 20, 3, 0, 0, 0, -1))
+        with mock.patch.object(codex_plugin.time, "time", return_value=first):
+            self.plugin._record_persistent_exchange(context, "q1", "a1", seq_one)
+        with mock.patch.object(codex_plugin.time, "time", return_value=second):
+            self.plugin._record_persistent_exchange(context, "q2", "a2", seq_two)
+        with mock.patch.object(codex_plugin.time, "time", return_value=third):
+            self.plugin._record_persistent_exchange(context, "q3", "a3", seq_three)
 
         self.assertEqual(
             self.plugin._memory_lines_for_prompt(context),
-            ["Q: q2 | A: a2", "Q: q3 | A: a3"],
+            ["[2026-05-13 20:02] Q: q2 | A: a2", "[2026-05-13 20:03] Q: q3 | A: a3"],
         )
 
     def test_concurrency_cap_rejects_when_busy(self):
