@@ -125,6 +125,13 @@ class CodexPluginUnitTest(unittest.TestCase):
             ["Please provide a prompt. Usage: @codexhigh <prompt>"],
         )
 
+    def test_empty_prompt_no_context_mode(self):
+        self.plugin._handle_codex_request(self.irc, self.msg, "   ", mode="no")
+        self.assertEqual(
+            self.irc.replies,
+            ["Please provide a prompt. Usage: @codexno <prompt>"],
+        )
+
     def test_empty_prompt_long_mode(self):
         self.plugin._handle_codex_request(self.irc, self.msg, "   ", mode="long")
         self.assertEqual(
@@ -151,6 +158,36 @@ class CodexPluginUnitTest(unittest.TestCase):
         self.assertIn("search more thoroughly than normal mode", full_prompt)
         self.assertIn("Use multiple searches when needed", full_prompt)
         self.assertNotIn("Use one brief search pass", full_prompt)
+
+    def test_no_context_mode_uses_high_wrapper_without_context_sections(self):
+        self.plugin._config["persistentMemoryEnabled"] = True
+        timestamp = time.mktime((2026, 5, 13, 20, 3, 0, 0, 0, -1))
+        with mock.patch.object(codex_plugin.time, "time", return_value=timestamp):
+            self.plugin.doPrivmsg(self.irc, FakeMsg("alice", "#test", "nearby channel detail"))
+            self.plugin._record_persistent_exchange("#test", "prior q", "prior a", None)
+
+        with mock.patch.object(self.plugin, "_invoke_wrapper", return_value="Answer") as wrapped:
+            self.plugin._handle_codex_request(
+                self.irc,
+                self.msg,
+                "What changed this week?",
+                mode="no",
+            )
+
+        self.assertEqual(self.irc.replies, ["Answer"])
+        full_prompt = wrapped.call_args.args[1]
+        self.assertEqual(wrapped.call_args.args[2], 90)
+        self.assertEqual(wrapped.call_args.kwargs["mode"], "high")
+        self.assertIn("No channel lines or prior Codex exchanges are provided", full_prompt)
+        self.assertIn("Spend extra effort verifying current facts before answering.", full_prompt)
+        self.assertIn("Answer the USER QUERY above directly.", full_prompt)
+        self.assertIn("USER QUERY:\nWhat changed this week?", full_prompt)
+        self.assertNotIn("RECENT CODEX EXCHANGES", full_prompt)
+        self.assertNotIn("OPTIONAL INCIDENTAL CHANNEL CONTEXT", full_prompt)
+        self.assertNotIn("PRIMARY TRANSCRIPT CONTEXT", full_prompt)
+        self.assertNotIn("nearby channel detail", full_prompt)
+        self.assertNotIn("prior q", full_prompt)
+        self.assertNotIn("prior a", full_prompt)
 
     def test_long_mode_uses_long_prompt_and_high_wrapper_mode(self):
         self.plugin._config["maxContextLines"] = 1
@@ -366,10 +403,30 @@ class CodexPluginUnitTest(unittest.TestCase):
                     mode="long",
                 )
 
-        self.assertEqual(
-            self.plugin._memory_lines_for_prompt("#test"),
-            ["[2026-05-13 20:03] Q: long question? | A: Long answer"],
-        )
+        with mock.patch.object(codex_plugin.time, "time", return_value=timestamp):
+            self.assertEqual(
+                self.plugin._memory_lines_for_prompt("#test"),
+                ["[2026-05-13 20:03] Q: long question? | A: Long answer"],
+            )
+
+    def test_no_context_mode_records_successful_exchange_in_memory(self):
+        self.plugin._config["persistentMemoryEnabled"] = True
+        timestamp = time.mktime((2026, 5, 13, 20, 3, 0, 0, 0, -1))
+
+        with mock.patch.object(codex_plugin.time, "time", return_value=timestamp):
+            with mock.patch.object(self.plugin, "_invoke_wrapper", return_value="No-context answer"):
+                self.plugin._handle_codex_request(
+                    self.irc,
+                    self.msg,
+                    "no-context question?",
+                    mode="no",
+                )
+
+        with mock.patch.object(codex_plugin.time, "time", return_value=timestamp):
+            self.assertEqual(
+                self.plugin._memory_lines_for_prompt("#test"),
+                ["[2026-05-13 20:03] Q: no-context question? | A: No-context answer"],
+            )
 
     def test_persistent_memory_orders_by_reserved_sequence(self):
         self.plugin._config["persistentMemoryEnabled"] = True
@@ -385,10 +442,11 @@ class CodexPluginUnitTest(unittest.TestCase):
         with mock.patch.object(codex_plugin.time, "time", return_value=first):
             self.plugin._record_persistent_exchange(context, "q1", "a1", seq_one)
 
-        self.assertEqual(
-            self.plugin._memory_lines_for_prompt(context),
-            ["[2026-05-13 20:01] Q: q1 | A: a1", "[2026-05-13 20:02] Q: q2 | A: a2"],
-        )
+        with mock.patch.object(codex_plugin.time, "time", return_value=second):
+            self.assertEqual(
+                self.plugin._memory_lines_for_prompt(context),
+                ["[2026-05-13 20:01] Q: q1 | A: a1", "[2026-05-13 20:02] Q: q2 | A: a2"],
+            )
 
     def test_persistent_memory_prunes_to_max_exchanges(self):
         self.plugin._config["persistentMemoryEnabled"] = True
@@ -409,10 +467,11 @@ class CodexPluginUnitTest(unittest.TestCase):
         with mock.patch.object(codex_plugin.time, "time", return_value=third):
             self.plugin._record_persistent_exchange(context, "q3", "a3", seq_three)
 
-        self.assertEqual(
-            self.plugin._memory_lines_for_prompt(context),
-            ["[2026-05-13 20:02] Q: q2 | A: a2", "[2026-05-13 20:03] Q: q3 | A: a3"],
-        )
+        with mock.patch.object(codex_plugin.time, "time", return_value=third):
+            self.assertEqual(
+                self.plugin._memory_lines_for_prompt(context),
+                ["[2026-05-13 20:02] Q: q2 | A: a2", "[2026-05-13 20:03] Q: q3 | A: a3"],
+            )
 
     def test_concurrency_cap_rejects_when_busy(self):
         started = threading.Event()
@@ -583,6 +642,7 @@ class CodexWrapperUnitTest(unittest.TestCase):
         settings = codex_wrapper._runtime_settings(codex_wrapper.MODE_HIGH)
         body = codex_wrapper._codex_api_body("prompt text", settings)
 
+        self.assertEqual(body["model"], "gpt-5.5")
         self.assertEqual(body["reasoning"], {"effort": "medium"})
         self.assertEqual(body["tools"], [{"type": "web_search"}])
 

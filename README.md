@@ -73,6 +73,7 @@ copy for files such as `auth.json`; it is not a continuing sync mechanism.
 ```irc
 @codex <prompt>
 @codexhigh <prompt>
+@codexno <prompt>
 @codexlong <prompt>
 ```
 
@@ -88,6 +89,7 @@ Behavior summary:
 - Each request is stateless.
 - Recent channel or private-message context is included as untrusted context.
 - `@codexhigh` uses a higher-effort Codex preset.
+- `@codexno` uses the higher-effort preset without including channel context or prior Codex memory in the prompt.
 - `@codexlong` uses a larger in-memory transcript buffer for channel analysis, with local hour markers and per-line times.
 - Optional persistent memory stores timestamped successful Codex command query/reply pairs per context.
 - Output is sanitized for IRC by stripping markdown, links, control characters, and excess formatting.
@@ -110,6 +112,7 @@ Operational defaults in `plugin.py`:
 - Wrapper runtime base: Limnoria data directory for this plugin.
 - `@codexhigh` reasoning effort: `medium`
 - `@codexhigh` web search context size: `high`
+- `@codexno` reasoning and web search context settings: same as `@codexhigh`.
 - `@codexlong` context size: 1000 captured lines.
 - `@codexlong` context time format: hourly local markers plus `[HH:MM]` line prefixes.
 - Captured IRC line cap: 200 chars per line.
@@ -130,6 +133,7 @@ Mode-specific defaults:
 
 - `@codex`: `model_reasoning_effort = "low"`
 - `@codexhigh`: `model_reasoning_effort = "medium"`
+- `@codexno`: `model_reasoning_effort = "medium"` without prompt context sections.
 - `@codexlong`: `model_reasoning_effort = "medium"` with transcript-analysis prompt instructions.
 
 ## Manual Wrapper Test
