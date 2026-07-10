@@ -2,9 +2,7 @@
 """Run one stateless Codex request and print only the final assistant message."""
 
 import argparse
-import base64
 import glob
-import json
 import os
 import signal
 import shutil
@@ -13,8 +11,6 @@ import sys
 import tempfile
 import time
 import types
-import urllib.error
-import urllib.request
 
 
 DEFAULT_TIMEOUT_SECONDS = 90
@@ -24,28 +20,35 @@ STATE_DIR_ENV = "CODEX_WRAPPER_STATE_DIR"
 OUTPUT_DIR_ENV = "CODEX_WRAPPER_OUTPUT_DIR"
 TEMP_DIR_ENV = "CODEX_WRAPPER_TEMP_DIR"
 CANDIDATES_ENV = "CODEX_WRAPPER_CANDIDATES"
-CODEX_HOME_SOURCE_ENV = "CODEX_WRAPPER_CODEX_HOME_SOURCE"
+EXEC_CODEX_HOME_ENV = "CODEX_WRAPPER_EXEC_CODEX_HOME"
 MODE_NORMAL = "normal"
 MODE_HIGH = "high"
 ALLOWED_MODES = (MODE_NORMAL, MODE_HIGH)
-ALLOWED_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+ALLOWED_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 ALLOWED_WEB_SEARCH_CONTEXT_SIZES = ("low", "medium", "high")
 NON_FATAL_ROLLOUT_ERROR = "failed to record rollout items:"
-REFRESH_URL = "https://auth.openai.com/oauth/token"
-CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-REFRESH_SKEW_SECONDS = 30
-CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
-BACKEND_ENV_VAR = "CODEX_WRAPPER_BACKEND"
+EXEC_DISABLED_FEATURES = (
+    "shell_tool",
+    "apps",
+    "browser_use",
+    "computer_use",
+    "hooks",
+    "memories",
+    "multi_agent",
+    "plugins",
+    "remote_plugin",
+    "skill_mcp_dependency_install",
+)
 MODE_PRESETS = {
     MODE_NORMAL: {
-        "model": "gpt-5.5",
-        "reasoning_effort": "low",
+        "model": "gpt-5.6-terra",
+        "reasoning_effort": "medium",
         "web_search": "live",
         "web_search_context_size": None,
     },
     MODE_HIGH: {
-        "model": "gpt-5.5",
-        "reasoning_effort": "medium",
+        "model": "gpt-5.6-terra",
+        "reasoning_effort": "high",
         "web_search": "live",
         "web_search_context_size": "high",
     },
@@ -87,198 +90,6 @@ def _runtime_settings(mode, reasoning_effort=None, web_search_context_size=None)
     if web_search_context_size is not None:
         preset["web_search_context_size"] = web_search_context_size
     return preset
-
-
-def _runtime_config_text(settings):
-    lines = [
-        f'model = "{settings["model"]}"',
-        f'model_reasoning_effort = "{settings["reasoning_effort"]}"',
-        'model_reasoning_summary = "none"',
-        'model_verbosity = "low"',
-        f'web_search = "{settings["web_search"]}"',
-        "network_access = true",
-        'cli_auth_credentials_store = "file"',
-    ]
-    context_size = settings.get("web_search_context_size")
-    if context_size:
-        lines.append(f'tools.web_search = {{ context_size = "{context_size}" }}')
-    return "\n".join(lines) + "\n"
-
-
-def _jwt_exp(token):
-    try:
-        payload_b64 = token.split(".")[1]
-        payload_b64 += "=" * (-len(payload_b64) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode("ascii")))
-        return payload.get("exp")
-    except Exception:
-        return None
-
-
-def _read_codex_auth(code_home):
-    auth_path = os.path.join(code_home, "auth.json")
-    try:
-        with open(auth_path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except OSError as exc:
-        raise RuntimeError(f"failed to read Codex auth file: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"failed to parse Codex auth file: {exc}") from exc
-
-    if data.get("auth_mode") != "chatgpt":
-        raise RuntimeError("Codex auth file is not using ChatGPT auth mode")
-
-    tokens = data.get("tokens")
-    if not isinstance(tokens, dict) or not tokens.get("access_token"):
-        raise RuntimeError("Codex auth file does not contain a ChatGPT access token")
-    return auth_path, data, tokens
-
-
-def _write_codex_auth(auth_path, data):
-    tmp_path = auth_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=2)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp_path, auth_path)
-    os.chmod(auth_path, 0o600)
-
-
-def _refresh_codex_tokens(refresh_token, timeout_seconds):
-    body = json.dumps(
-        {
-            "client_id": CLIENT_ID,
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-        }
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        REFRESH_URL,
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Codex token refresh failed: HTTP {exc.code}: {detail}") from None
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Codex token refresh failed: {exc}") from None
-
-
-def _borrow_codex_key(code_home, timeout_seconds):
-    auth_path, data, tokens = _read_codex_auth(code_home)
-    access_token = tokens["access_token"]
-    exp = _jwt_exp(access_token)
-    if exp is None or time.time() < (float(exp) - REFRESH_SKEW_SECONDS):
-        return access_token, tokens.get("account_id")
-
-    refresh_token = tokens.get("refresh_token")
-    if not refresh_token:
-        raise RuntimeError("Codex auth file does not contain a refresh token")
-
-    refreshed = _refresh_codex_tokens(refresh_token, timeout_seconds)
-    for key in ("access_token", "id_token", "refresh_token"):
-        if refreshed.get(key):
-            tokens[key] = refreshed[key]
-    data["tokens"] = tokens
-    data["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
-    _write_codex_auth(auth_path, data)
-    return tokens["access_token"], tokens.get("account_id")
-
-
-def _extract_response_text(payload):
-    if not isinstance(payload, dict):
-        return ""
-
-    direct = payload.get("output_text")
-    if isinstance(direct, str) and direct.strip():
-        return direct.strip()
-
-    chunks = []
-    for item in payload.get("output", []) or []:
-        if not isinstance(item, dict):
-            continue
-        for content in item.get("content", []) or []:
-            if not isinstance(content, dict):
-                continue
-            if content.get("type") in ("output_text", "text"):
-                text = content.get("text")
-                if isinstance(text, str):
-                    chunks.append(text)
-    return "".join(chunks).strip()
-
-
-def _codex_api_body(prompt_text, settings):
-    body = {
-        "model": settings["model"],
-        "input": [{"role": "user", "content": prompt_text}],
-        "instructions": "You are a helpful assistant.",
-        "store": False,
-        "reasoning": {"effort": settings["reasoning_effort"]},
-        "text": {"verbosity": "low"},
-        "stream": True,
-    }
-    body["tools"] = [{"type": "web_search"}]
-    return body
-
-
-def _codex_api_request(prompt_text, settings, layout, timeout_seconds):
-    token, account_id = _borrow_codex_key(layout["code_home"], min(timeout_seconds, 30))
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
-    if account_id:
-        headers["ChatGPT-Account-ID"] = account_id
-
-    req = urllib.request.Request(
-        f"{CODEX_BASE_URL}/responses",
-        data=json.dumps(_codex_api_body(prompt_text, settings)).encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
-            chunks = []
-            for raw_line in resp:
-                line = raw_line.decode("utf-8", errors="replace").strip()
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if not data or data == "[DONE]":
-                    continue
-                try:
-                    event = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                event_type = event.get("type")
-                if event_type == "response.output_text.delta":
-                    delta = event.get("delta")
-                    if isinstance(delta, str):
-                        chunks.append(delta)
-                elif event_type == "response.completed":
-                    text = "".join(chunks).strip()
-                    if text:
-                        return text
-                    response = event.get("response")
-                    text = _extract_response_text(response)
-                    if text:
-                        return text
-                elif event_type == "response.failed":
-                    error = event.get("error") or {}
-                    raise RuntimeError(f"Codex API response failed: {error}")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Codex API request failed: HTTP {exc.code}: {detail}") from None
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Codex API request failed: {exc}") from None
-    if chunks:
-        return "".join(chunks).strip()
-    raise RuntimeError("Codex API response did not contain output text")
 
 
 def _terminate_process_group(pid):
@@ -377,15 +188,44 @@ def _run_with_timeout(cmd, input_text, env, timeout_seconds, cwd=None, temp_dir=
                 pass
 
 
-def _codex_child_env(codex_binary, layout):
-    run_env = os.environ.copy()
-    for key in list(run_env):
-        if key.startswith("CODEX_"):
-            run_env.pop(key, None)
+def _resolve_exec_codex_home():
+    configured = os.environ.get(EXEC_CODEX_HOME_ENV, "").strip()
+    candidate = configured or os.path.join(os.path.expanduser("~"), ".codex")
+    code_home = os.path.abspath(os.path.expanduser(candidate))
+    auth_path = os.path.join(code_home, "auth.json")
+
+    if not os.path.isdir(code_home):
+        raise RuntimeError(f"shared Codex home does not exist: {code_home}")
+    if not os.path.isfile(auth_path):
+        raise RuntimeError(f"shared Codex auth file does not exist: {auth_path}")
+    if not os.access(auth_path, os.R_OK | os.W_OK):
+        raise RuntimeError(f"shared Codex auth file is not readable and writable: {auth_path}")
+    if not os.access(code_home, os.W_OK):
+        raise RuntimeError(f"shared Codex home is not writable: {code_home}")
+    return code_home
+
+
+def _codex_child_env(codex_binary, layout, code_home):
+    inherited_keys = (
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "PATH",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+    )
+    run_env = {key: os.environ[key] for key in inherited_keys if os.environ.get(key)}
 
     codex_dir = os.path.dirname(codex_binary)
     run_env["PATH"] = codex_dir + os.pathsep + run_env.get("PATH", "")
-    run_env["CODEX_HOME"] = layout["code_home"]
+    run_env["CODEX_HOME"] = code_home
     run_env["TMPDIR"] = layout["temp"]
     run_env["TMP"] = layout["temp"]
     run_env["TEMP"] = layout["temp"]
@@ -393,6 +233,51 @@ def _codex_child_env(codex_binary, layout):
     run_env.setdefault("NO_COLOR", "1")
     run_env["PWD"] = layout["agent_cwd"]
     return run_env
+
+
+def _exec_command(codex_binary, settings, layout, output_path):
+    cmd = [
+        codex_binary,
+        "exec",
+        "--strict-config",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--color",
+        "never",
+        "-m",
+        settings["model"],
+        "-s",
+        "read-only",
+        "-C",
+        layout["agent_cwd"],
+        "--skip-git-repo-check",
+        "-c",
+        'approval_policy="never"',
+        "-c",
+        'cli_auth_credentials_store="file"',
+        "-c",
+        'history.persistence="none"',
+        "-c",
+        'shell_environment_policy.inherit="none"',
+        "-c",
+        f'model_reasoning_effort="{settings["reasoning_effort"]}"',
+        "-c",
+        'model_reasoning_summary="none"',
+        "-c",
+        'model_verbosity="low"',
+        "-c",
+        f'web_search="{settings["web_search"]}"',
+    ]
+    for feature in EXEC_DISABLED_FEATURES:
+        cmd.extend(("-c", f"features.{feature}=false"))
+
+    context_size = settings.get("web_search_context_size")
+    if context_size:
+        cmd.extend(("-c", f'tools.web_search.context_size="{context_size}"'))
+
+    cmd.extend(("--output-last-message", output_path, "-"))
+    return cmd
 
 
 def _read_last_message(output_path):
@@ -457,7 +342,8 @@ def _resolve_codex_binary():
         return explicit
 
     discovered = shutil.which("codex")
-    if discovered:
+    session_launcher = os.path.join(".codex", "tmp", "arg0")
+    if discovered and session_launcher not in os.path.abspath(discovered):
         return discovered
 
     home = os.path.expanduser("~")
@@ -543,14 +429,12 @@ def _resolve_write_layout():
         state = _ensure_writable_dir(configured_state, "state dir")
         output = _ensure_writable_dir(configured_output, "output dir")
         temp = _ensure_writable_dir(configured_temp, "temp dir")
-        code_home = _ensure_writable_dir(os.path.join(state, "codex-home"), "CODEX_HOME")
         agent_cwd = _ensure_writable_dir(os.path.join(temp, "agent-cwd"), "agent cwd")
         return {
             "base": base,
             "state": state,
             "output": output,
             "temp": temp,
-            "code_home": code_home,
             "agent_cwd": agent_cwd,
         }
 
@@ -561,14 +445,12 @@ def _resolve_write_layout():
             state = _ensure_writable_dir(os.path.join(base, "state"), "state dir")
             output = _ensure_writable_dir(os.path.join(base, "output"), "output dir")
             temp = _ensure_writable_dir(os.path.join(base, "tmp"), "temp dir")
-            code_home = _ensure_writable_dir(os.path.join(state, "codex-home"), "CODEX_HOME")
             agent_cwd = _ensure_writable_dir(os.path.join(temp, "agent-cwd"), "agent cwd")
             return {
                 "base": base,
                 "state": state,
                 "output": output,
                 "temp": temp,
-                "code_home": code_home,
                 "agent_cwd": agent_cwd,
             }
         except RuntimeError as exc:
@@ -576,38 +458,6 @@ def _resolve_write_layout():
 
     detail = "; ".join(failures) if failures else "no candidate paths"
     raise RuntimeError(f"runtime write-path preflight failed: {detail}")
-
-
-def _prepare_codex_home(runtime_codex_home, config_text):
-    source_home = os.environ.get(CODEX_HOME_SOURCE_ENV, "").strip()
-    if not source_home:
-        source_home = os.path.join(os.path.expanduser("~"), ".codex")
-    source_home = os.path.abspath(os.path.expanduser(source_home))
-    runtime_codex_home = os.path.abspath(os.path.expanduser(runtime_codex_home))
-
-    if source_home != runtime_codex_home:
-        for filename in ("auth.json", "version.json", "models_cache.json"):
-            source_file = os.path.join(source_home, filename)
-            target_file = os.path.join(runtime_codex_home, filename)
-            # Source homes are bootstrap-only. Once a runtime file exists,
-            # preserve it so Codex can refresh tokens in place over time.
-            if os.path.isfile(target_file) or not os.path.isfile(source_file):
-                continue
-            try:
-                shutil.copy2(source_file, target_file)
-            except OSError as exc:
-                raise RuntimeError(
-                    f"failed to stage {filename} into runtime CODEX_HOME: {exc}"
-                ) from exc
-
-    config_path = os.path.join(runtime_codex_home, "config.toml")
-    try:
-        with open(config_path, "w", encoding="utf-8") as handle:
-            handle.write(config_text)
-    except OSError as exc:
-        raise RuntimeError(
-            f"failed to write hardened runtime config.toml: {exc}"
-        ) from exc
 
 
 def main():
@@ -654,47 +504,12 @@ def main():
         print("empty prompt", file=sys.stderr)
         return 2
 
-    backend = os.environ.get(BACKEND_ENV_VAR, "api").strip().lower()
-    if backend not in ("api", "exec"):
-        print(f"unsupported Codex backend: {backend}", file=sys.stderr)
-        return 2
-
     try:
         layout = _resolve_write_layout()
-        _prepare_codex_home(layout["code_home"], _runtime_config_text(settings))
+        exec_code_home = _resolve_exec_codex_home()
     except RuntimeError as exc:
         print(str(exc)[:300], file=sys.stderr)
         return 125
-
-    if backend == "api":
-        _append_debug_line(
-            layout,
-            (
-                "api_request "
-                f"model={settings['model']!r} "
-                f"mode={args.mode!r} "
-                f"wrapper_cwd={os.getcwd()!r} "
-                f"stdin_tty={sys.stdin.isatty()} "
-                f"stdout_tty={sys.stdout.isatty()} "
-                f"stderr_tty={sys.stderr.isatty()}"
-            ),
-        )
-        try:
-            response_text = _codex_api_request(
-                prompt_text,
-                settings,
-                layout,
-                timeout_seconds,
-            )
-        except RuntimeError as exc:
-            _append_debug_line(layout, f"api_error detail={str(exc)[:240]!r}")
-            print(str(exc)[:300], file=sys.stderr)
-            return 1
-
-        sys.stdout.write(response_text)
-        if not response_text.endswith("\n"):
-            sys.stdout.write("\n")
-        return 0
 
     codex_binary = _resolve_codex_binary()
     if not codex_binary:
@@ -711,43 +526,14 @@ def main():
         ) as handle:
             output_path = handle.name
 
-        cmd = [
-            codex_binary,
-            "exec",
-            "-m",
-            settings["model"],
-            "-s",
-            "read-only",
-            "-C",
-            layout["agent_cwd"],
-            "--ignore-user-config",
-            "--ignore-rules",
-            # codex-cli 0.101.0 accepted values:
-            # - model_reasoning_effort: none|minimal|low|medium|high|xhigh
-            # - model_verbosity: low|medium|high
-            # Note: with web_search="live", reasoning_effort="minimal" is rejected.
-            "-c",
-            f'model_reasoning_effort="{settings["reasoning_effort"]}"',
-            "-c",
-            'model_reasoning_summary="none"',
-            "-c",
-            'model_verbosity="low"',
-            "-c",
-            f'web_search="{settings["web_search"]}"',
-            "--skip-git-repo-check",
-            "--output-last-message",
-            output_path,
-            "-",
-        ]
-        context_size = settings.get("web_search_context_size")
-        if context_size:
-            cmd[cmd.index("--skip-git-repo-check"):cmd.index("--skip-git-repo-check")] = [
-                "-c",
-                f'tools.web_search.context_size="{context_size}"',
-            ]
+        cmd = _exec_command(codex_binary, settings, layout, output_path)
 
         try:
-            child_env = _codex_child_env(codex_binary, layout)
+            child_env = _codex_child_env(
+                codex_binary,
+                layout,
+                code_home=exec_code_home,
+            )
             _append_debug_line(
                 layout,
                 (

@@ -539,7 +539,7 @@ class CodexPluginUnitTest(unittest.TestCase):
         self.assertIn("high", cmd)
         self.assertIn("--reasoning-effort", cmd)
         self.assertIn("--web-search-context-size", cmd)
-        self.assertEqual(cmd[cmd.index("--reasoning-effort") + 1], "medium")
+        self.assertEqual(cmd[cmd.index("--reasoning-effort") + 1], "high")
         self.assertEqual(cmd[cmd.index("--web-search-context-size") + 1], "high")
 
     def test_subprocess_timeout_maps_to_wrapper_timeout(self):
@@ -568,83 +568,16 @@ class CodexWrapperUnitTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def test_prepare_codex_home_bootstraps_missing_files(self):
-        source_auth = os.path.join(self.source_home, "auth.json")
-        source_version = os.path.join(self.source_home, "version.json")
-        with open(source_auth, "w", encoding="utf-8") as handle:
-            handle.write("source-auth")
-        with open(source_version, "w", encoding="utf-8") as handle:
-            handle.write("source-version")
-
-        with mock.patch.dict(
-            os.environ,
-            {codex_wrapper.CODEX_HOME_SOURCE_ENV: self.source_home},
-            clear=False,
-        ):
-            codex_wrapper._prepare_codex_home(
-                self.runtime_home,
-                codex_wrapper._runtime_config_text(
-                    codex_wrapper._runtime_settings(codex_wrapper.MODE_NORMAL)
-                ),
-            )
-
-        with open(os.path.join(self.runtime_home, "auth.json"), "r", encoding="utf-8") as handle:
-            self.assertEqual(handle.read(), "source-auth")
-        with open(os.path.join(self.runtime_home, "version.json"), "r", encoding="utf-8") as handle:
-            self.assertEqual(handle.read(), "source-version")
-        with open(os.path.join(self.runtime_home, "config.toml"), "r", encoding="utf-8") as handle:
-            config_text = handle.read()
-        self.assertIn('cli_auth_credentials_store = "file"', config_text)
-
-    def test_prepare_codex_home_preserves_existing_runtime_auth(self):
-        with open(os.path.join(self.source_home, "auth.json"), "w", encoding="utf-8") as handle:
-            handle.write("source-auth")
-        with open(os.path.join(self.runtime_home, "auth.json"), "w", encoding="utf-8") as handle:
-            handle.write("runtime-auth")
-
-        with mock.patch.dict(
-            os.environ,
-            {codex_wrapper.CODEX_HOME_SOURCE_ENV: self.source_home},
-            clear=False,
-        ):
-            codex_wrapper._prepare_codex_home(
-                self.runtime_home,
-                codex_wrapper._runtime_config_text(
-                    codex_wrapper._runtime_settings(codex_wrapper.MODE_NORMAL)
-                ),
-            )
-
-        with open(os.path.join(self.runtime_home, "auth.json"), "r", encoding="utf-8") as handle:
-            self.assertEqual(handle.read(), "runtime-auth")
-        with open(os.path.join(self.runtime_home, "config.toml"), "r", encoding="utf-8") as handle:
-            config_text = handle.read()
-        self.assertIn('cli_auth_credentials_store = "file"', config_text)
-
-    def test_runtime_config_text_high_mode_includes_web_search_context(self):
-        settings = codex_wrapper._runtime_settings(codex_wrapper.MODE_HIGH)
-        config_text = codex_wrapper._runtime_config_text(settings)
-        self.assertIn('model_reasoning_effort = "medium"', config_text)
-        self.assertIn('web_search = "live"', config_text)
-        self.assertIn('tools.web_search = { context_size = "high" }', config_text)
-
-    def test_codex_api_body_includes_streaming_web_search_tool(self):
-        settings = codex_wrapper._runtime_settings(codex_wrapper.MODE_NORMAL)
-        body = codex_wrapper._codex_api_body("prompt text", settings)
-
-        self.assertEqual(body["model"], "gpt-5.5")
-        self.assertEqual(body["input"], [{"role": "user", "content": "prompt text"}])
-        self.assertEqual(body["reasoning"], {"effort": "low"})
-        self.assertEqual(body["text"], {"verbosity": "low"})
-        self.assertTrue(body["stream"])
-        self.assertEqual(body["tools"], [{"type": "web_search"}])
-
-    def test_codex_api_body_high_mode_keeps_web_search_tool_shape(self):
-        settings = codex_wrapper._runtime_settings(codex_wrapper.MODE_HIGH)
-        body = codex_wrapper._codex_api_body("prompt text", settings)
-
-        self.assertEqual(body["model"], "gpt-5.5")
-        self.assertEqual(body["reasoning"], {"effort": "medium"})
-        self.assertEqual(body["tools"], [{"type": "web_search"}])
+    def test_terra_mode_mappings(self):
+        normal = codex_wrapper._runtime_settings(codex_wrapper.MODE_NORMAL)
+        high = codex_wrapper._runtime_settings(codex_wrapper.MODE_HIGH)
+        self.assertEqual(normal["model"], "gpt-5.6-terra")
+        self.assertEqual(normal["reasoning_effort"], "medium")
+        self.assertEqual(high["model"], "gpt-5.6-terra")
+        self.assertEqual(high["reasoning_effort"], "high")
+        self.assertNotIn("minimal", codex_wrapper.ALLOWED_REASONING_EFFORTS)
+        self.assertIn("none", codex_wrapper.ALLOWED_REASONING_EFFORTS)
+        self.assertIn("max", codex_wrapper.ALLOWED_REASONING_EFFORTS)
 
     def test_has_non_fatal_rollout_error(self):
         self.assertTrue(
@@ -656,7 +589,6 @@ class CodexWrapperUnitTest(unittest.TestCase):
 
     def test_codex_child_env_scrubs_inherited_codex_control_variables(self):
         layout = {
-            "code_home": self.runtime_home,
             "temp": self.tmpdir,
             "agent_cwd": os.path.join(self.tmpdir, "agent-cwd"),
         }
@@ -667,18 +599,111 @@ class CodexWrapperUnitTest(unittest.TestCase):
                 "CODEX_CI": "1",
                 "CODEX_SANDBOX_NETWORK_DISABLED": "1",
                 "CODEX_WRAPPER_TIMEOUT": "90",
+                "BOT_SECRET": "do-not-inherit",
                 "PATH": "/usr/bin",
             },
             clear=False,
         ):
-            child_env = codex_wrapper._codex_child_env("/opt/codex/bin/codex", layout)
+            child_env = codex_wrapper._codex_child_env(
+                "/opt/codex/bin/codex",
+                layout,
+                code_home=self.runtime_home,
+            )
 
         self.assertEqual(child_env["CODEX_HOME"], self.runtime_home)
         self.assertNotIn("CODEX_THREAD_ID", child_env)
         self.assertNotIn("CODEX_CI", child_env)
         self.assertNotIn("CODEX_SANDBOX_NETWORK_DISABLED", child_env)
         self.assertNotIn("CODEX_WRAPPER_TIMEOUT", child_env)
+        self.assertNotIn("BOT_SECRET", child_env)
         self.assertTrue(child_env["PATH"].startswith("/opt/codex/bin:"))
+
+    def test_resolve_exec_codex_home_requires_shared_file_auth(self):
+        auth_path = os.path.join(self.source_home, "auth.json")
+        with open(auth_path, "w", encoding="utf-8") as handle:
+            handle.write("shared-auth")
+
+        with mock.patch.dict(
+            os.environ,
+            {codex_wrapper.EXEC_CODEX_HOME_ENV: self.source_home},
+            clear=False,
+        ):
+            self.assertEqual(
+                codex_wrapper._resolve_exec_codex_home(),
+                self.source_home,
+            )
+
+        os.unlink(auth_path)
+        with mock.patch.dict(
+            os.environ,
+            {codex_wrapper.EXEC_CODEX_HOME_ENV: self.source_home},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "auth file does not exist"):
+                codex_wrapper._resolve_exec_codex_home()
+
+    def test_resolve_codex_binary_skips_nested_session_launcher(self):
+        installed = "/home/test/.nvm/versions/node/v20/bin/codex"
+        nested = "/home/test/.codex/tmp/arg0/session/codex"
+        with mock.patch.dict(os.environ, {"HOME": "/home/test", "CODEX_BIN": ""}), \
+             mock.patch.object(codex_wrapper.shutil, "which", return_value=nested), \
+             mock.patch.object(codex_wrapper.glob, "glob", return_value=[installed]), \
+             mock.patch.object(
+                 codex_wrapper.os.path,
+                 "isfile",
+                 side_effect=lambda path: path == installed,
+             ), \
+             mock.patch.object(codex_wrapper.os, "access", return_value=True):
+            self.assertEqual(codex_wrapper._resolve_codex_binary(), installed)
+
+    def test_codex_child_env_can_use_shared_auth_home(self):
+        layout = {
+            "temp": self.tmpdir,
+            "agent_cwd": os.path.join(self.tmpdir, "agent-cwd"),
+        }
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PATH": "/usr/bin",
+                "BOT_PASSWORD": "secret",
+                "CODEX_THREAD_ID": "parent-thread",
+            },
+            clear=False,
+        ):
+            child_env = codex_wrapper._codex_child_env(
+                "/opt/codex/bin/codex",
+                layout,
+                code_home=self.source_home,
+            )
+
+        self.assertEqual(child_env["CODEX_HOME"], self.source_home)
+        self.assertEqual(child_env["PWD"], layout["agent_cwd"])
+        self.assertNotIn("BOT_PASSWORD", child_env)
+        self.assertNotIn("CODEX_THREAD_ID", child_env)
+
+    def test_exec_command_is_ephemeral_strict_and_tool_disabled(self):
+        settings = codex_wrapper._runtime_settings(codex_wrapper.MODE_HIGH)
+        layout = {"agent_cwd": os.path.join(self.tmpdir, "agent-cwd")}
+        cmd = codex_wrapper._exec_command(
+            "/opt/codex/bin/codex",
+            settings,
+            layout,
+            os.path.join(self.tmpdir, "last-message.txt"),
+        )
+
+        self.assertIn("--strict-config", cmd)
+        self.assertIn("--ephemeral", cmd)
+        self.assertIn("--ignore-user-config", cmd)
+        self.assertIn("--ignore-rules", cmd)
+        self.assertIn("read-only", cmd)
+        self.assertIn('approval_policy="never"', cmd)
+        self.assertIn('history.persistence="none"', cmd)
+        self.assertIn('shell_environment_policy.inherit="none"', cmd)
+        self.assertIn('web_search="live"', cmd)
+        self.assertIn('tools.web_search.context_size="high"', cmd)
+        for feature in codex_wrapper.EXEC_DISABLED_FEATURES:
+            self.assertIn(f"features.{feature}=false", cmd)
+        self.assertEqual(cmd[-1], "-")
 
 
 if __name__ == "__main__":

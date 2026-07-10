@@ -4,15 +4,14 @@ Stateless IRC command integration for Codex-backed model requests.
 
 This plugin is intentionally designed for people who have access to Codex through a
 ChatGPT/Codex subscription. It does not use an OpenAI API key. Instead, the wrapper
-uses Codex CLI-style ChatGPT authentication state from a local `auth.json` runtime
-home, refreshes that state as needed, and sends requests to the Codex backend.
+uses the installed Codex CLI with shared ChatGPT authentication and a hardened,
+plugin-owned execution workspace.
 
 ## Status
 
-This is a small, opinionated plugin extracted from a live Limnoria bot. It is useful
-as a working reference for subscription-backed Codex usage from IRC, but the
-authentication path depends on Codex/ChatGPT internals rather than the public
-OpenAI API-key workflow.
+This is a small, opinionated plugin extracted from a live Limnoria bot. It uses
+the supported non-interactive `codex exec` interface for subscription-backed
+requests from IRC.
 
 ## Install
 
@@ -47,26 +46,32 @@ Optional channel allowlist:
 
 ## Authentication
 
-The default backend expects a Codex/ChatGPT `auth.json` in the wrapper runtime home.
-By default, the plugin creates that runtime under Limnoria's data directory for the
-plugin, typically equivalent to:
+The default `exec` backend uses the normal shared Codex home at `~/.codex`.
+Override it with `CODEX_WRAPPER_EXEC_CODEX_HOME` when needed. It uses the
+official CLI to read and refresh that shared authentication; it does not copy
+`auth.json` or write bot configuration into the shared home.
 
-```text
-data/Codex/state/codex-home
+Exec requests ignore shared user configuration and rules, run without persisted
+session files, and use an empty plugin-owned working directory. Local shell,
+apps, plugins, hooks, browser/computer use, memories, and multi-agent features
+are disabled. Hosted web search remains available.
+
+The current deployment is validated with `codex-cli 0.144.1`.
+
+### systemd deployment
+
+If the bot service uses `ProtectHome=read-only`, grant the service write access
+to the shared Codex home so the official CLI can refresh authentication. For
+example, `/etc/systemd/system/ircbot.service.d/codex-auth.conf`:
+
+```ini
+[Service]
+ReadWritePaths=/home/nelluk/.codex
 ```
 
-On a headless server, log in with device auth against that runtime home:
-
-```bash
-CODEX_HOME=/path/to/limnoria/data/Codex/state/codex-home codex login --device-auth
-```
-
-The wrapper keeps its own runtime `config.toml`, uses file-backed auth, and does
-not import trusted Codex project settings from the source `CODEX_HOME`.
-
-If you already have a Codex CLI home and want to bootstrap the runtime from it, set
-`CODEX_WRAPPER_CODEX_HOME_SOURCE` for the wrapper process. This is only a bootstrap
-copy for files such as `auth.json`; it is not a continuing sync mechanism.
+Then run `systemctl daemon-reload` and restart the bot service. Other home paths
+remain read-only. The Codex child still ignores shared user configuration and
+rules and exposes no local shell or filesystem tool to IRC prompts.
 
 ## Commands
 
@@ -110,7 +115,7 @@ Operational defaults in `plugin.py`:
 
 - Wrapper script: `scripts/codex_wrapper.py`
 - Wrapper runtime base: Limnoria data directory for this plugin.
-- `@codexhigh` reasoning effort: `medium`
+- `@codexhigh` reasoning effort: `high`
 - `@codexhigh` web search context size: `high`
 - `@codexno` reasoning and web search context settings: same as `@codexhigh`.
 - `@codexlong` context size: 1000 captured lines.
@@ -123,32 +128,38 @@ Operational defaults in `plugin.py`:
 
 Codex runtime defaults in `scripts/codex_wrapper.py`:
 
-- `model = "gpt-5.5"`
+- Backend: hardened `codex exec`.
+- `model = "gpt-5.6-terra"`
 - `model_reasoning_summary = "none"`
 - `model_verbosity = "low"`
-- Hosted web search tool enabled for the default direct backend.
-- Legacy exec backend only: `web_search = "live"`
+- Hosted web search enabled through `web_search = "live"`.
+- Exec sessions are ephemeral and use shared CLI authentication while ignoring
+  shared user configuration and rules.
+- Exec local tool families are disabled; the read-only sandbox is retained as
+  defense in depth.
 
 Mode-specific defaults:
 
-- `@codex`: `model_reasoning_effort = "low"`
-- `@codexhigh`: `model_reasoning_effort = "medium"`
-- `@codexno`: `model_reasoning_effort = "medium"` without prompt context sections.
-- `@codexlong`: `model_reasoning_effort = "medium"` with transcript-analysis prompt instructions.
+- `@codex`: `model_reasoning_effort = "medium"`
+- `@codexhigh`: `model_reasoning_effort = "high"`
+- `@codexno`: `model_reasoning_effort = "high"` without prompt context sections.
+- `@codexlong`: `model_reasoning_effort = "high"` with transcript-analysis prompt instructions.
 
 ## Manual Wrapper Test
 
-Default direct Codex backend:
+Default hardened Codex CLI backend using shared `~/.codex` authentication:
 
 ```bash
 printf '%s\n' 'Say hello in one short sentence.' | plugins/Codex/scripts/codex_wrapper.py --timeout 90
 printf '%s\n' 'Verify the latest Fedora release.' | plugins/Codex/scripts/codex_wrapper.py --timeout 90 --mode high
 ```
 
-Legacy Codex CLI backend:
+Custom shared Codex home:
 
 ```bash
-printf '%s\n' 'Say hello in one short sentence.' | CODEX_WRAPPER_BACKEND=exec plugins/Codex/scripts/codex_wrapper.py --timeout 90
+printf '%s\n' 'Say hello.' | \
+  CODEX_WRAPPER_EXEC_CODEX_HOME=/path/to/shared/.codex \
+  plugins/Codex/scripts/codex_wrapper.py --timeout 90
 ```
 
 Custom runtime base:
@@ -180,8 +191,10 @@ PYTHONPATH=/opt/limnoria /opt/limnoria/bin/python -m unittest plugins.Codex.test
 ## Troubleshooting
 
 - `Codex runtime path error`: verify the Limnoria process can write to its data directory.
-- `codex binary not found`: this applies only to `CODEX_WRAPPER_BACKEND=exec`; install Codex CLI and ensure `codex` is on the bot process PATH.
-- Authentication failures: re-run `codex login --device-auth` with `CODEX_HOME` pointed at the plugin runtime home.
+- `codex binary not found`: install Codex CLI and ensure `codex` is on the bot process PATH.
+- Authentication failures: verify the bot account can read and
+  update the shared `~/.codex/auth.json`, or set
+  `CODEX_WRAPPER_EXEC_CODEX_HOME` to the intended shared Codex home.
 - Timeouts: increase `plugins.codex.timeoutSeconds`, shorten prompts, or reduce unnecessary context.
 - Busy replies: the plugin allows one active request at a time.
 

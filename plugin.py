@@ -44,7 +44,7 @@ class Codex(callbacks.Plugin):
     threaded = True
     WRAPPER_PATH = os.path.join(os.path.dirname(__file__), "scripts", "codex_wrapper.py")
     WRAPPER_WRITABLE_BASE = None
-    HIGH_REASONING_EFFORT = "medium"
+    HIGH_REASONING_EFFORT = "high"
     HIGH_WEB_SEARCH_CONTEXT_SIZE = "high"
     CONTEXT_LINE_CHARS = 200
     LONG_CONTEXT_LINES = 1000
