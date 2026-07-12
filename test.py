@@ -241,7 +241,47 @@ class CodexPluginUnitTest(unittest.TestCase):
 
         self.assertEqual(
             self.irc.replies,
-            ["Codex request failed. Please try again in a moment."],
+            ["Codex request failed. Nelluk has been notified."],
+        )
+
+    def test_auth_error_reply_is_actionable(self):
+        with mock.patch.object(
+            self.plugin,
+            "_invoke_wrapper",
+            side_effect=WrapperExecutionError("401 Unauthorized: refresh token expired"),
+        ):
+            self.plugin._handle_codex_request(self.irc, self.msg, "hello")
+
+        self.assertEqual(
+            self.irc.replies,
+            ["Codex authentication needs attention. Nelluk should run codex login."],
+        )
+
+    def test_quota_error_reply_includes_reset_when_available(self):
+        with mock.patch.object(
+            self.plugin,
+            "_invoke_wrapper",
+            side_effect=WrapperExecutionError(
+                "You've hit your usage limit. Try again at 12:15 PM. request_id=secret"
+            ),
+        ):
+            self.plugin._handle_codex_request(self.irc, self.msg, "hello")
+
+        self.assertEqual(
+            self.irc.replies,
+            ["Codex usage limit reached. Try again after 12:15 PM."],
+        )
+
+    def test_quota_error_reply_without_reset_is_still_specific(self):
+        self.assertEqual(
+            self.plugin._friendly_wrapper_error("insufficient_quota"),
+            "Codex usage limit reached. Please try again later.",
+        )
+
+    def test_network_error_reply_is_specific(self):
+        self.assertEqual(
+            self.plugin._friendly_wrapper_error("503 Service Unavailable"),
+            "Codex is temporarily unreachable. Please try again in a moment.",
         )
 
     def test_runtime_preflight_error(self):
@@ -695,6 +735,7 @@ class CodexWrapperUnitTest(unittest.TestCase):
         self.assertIn("--ephemeral", cmd)
         self.assertIn("--ignore-user-config", cmd)
         self.assertIn("--ignore-rules", cmd)
+        self.assertIn("--json", cmd)
         self.assertIn("read-only", cmd)
         self.assertIn('approval_policy="never"', cmd)
         self.assertIn('history.persistence="none"', cmd)
@@ -704,6 +745,18 @@ class CodexWrapperUnitTest(unittest.TestCase):
         for feature in codex_wrapper.EXEC_DISABLED_FEATURES:
             self.assertIn(f"features.{feature}=false", cmd)
         self.assertEqual(cmd[-1], "-")
+
+    def test_structured_error_detail_extracts_failed_turn_message(self):
+        stream = "\n".join(
+            [
+                '{"type":"thread.started","thread_id":"abc"}',
+                '{"type":"turn.failed","error":{"message":"Usage limit reached. Try again at 12:15 PM."}}',
+            ]
+        )
+        self.assertEqual(
+            codex_wrapper._structured_error_detail(stream),
+            "Usage limit reached. Try again at 12:15 PM.",
+        )
 
 
 if __name__ == "__main__":

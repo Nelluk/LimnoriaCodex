@@ -3,6 +3,7 @@
 
 import argparse
 import glob
+import json
 import os
 import signal
 import shutil
@@ -245,6 +246,7 @@ def _exec_command(codex_binary, settings, layout, output_path):
         "--ignore-rules",
         "--color",
         "never",
+        "--json",
         "-m",
         settings["model"],
         "-s",
@@ -295,6 +297,38 @@ def _has_non_fatal_rollout_error(text):
 def _last_nonempty_lines(text, limit=6):
     lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
     return lines[-limit:]
+
+
+def _structured_error_detail(text):
+    """Extract useful failure text from codex exec's JSONL event stream."""
+    messages = []
+    for line in (text or "").splitlines():
+        try:
+            event = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(event, dict) or event.get("type") not in (
+            "error",
+            "turn.failed",
+        ):
+            continue
+
+        candidates = [event.get("message")]
+        error = event.get("error")
+        if isinstance(error, str):
+            candidates.append(error)
+        elif isinstance(error, dict):
+            candidates.extend(
+                error.get(key) for key in ("message", "detail", "description")
+            )
+
+        for candidate in candidates:
+            if isinstance(candidate, str):
+                candidate = " ".join(candidate.split())
+                if candidate and candidate not in messages:
+                    messages.append(candidate)
+
+    return " | ".join(messages)[-2000:]
 
 
 def _timeout_detail(exc):
@@ -570,7 +604,9 @@ def main():
             return 126
 
         if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout or "").strip()
+            raw_detail = (proc.stderr or proc.stdout or "").strip()
+            structured_detail = _structured_error_detail(proc.stdout)
+            detail = structured_detail or raw_detail
             _append_debug_line(
                 layout,
                 f"exit returncode={proc.returncode} detail_tail={_timeout_detail(proc)}",

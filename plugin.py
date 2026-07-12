@@ -1,5 +1,6 @@
 """Stateless Codex IRC integration via a local wrapper script."""
 
+import builtins
 import os
 import re
 import signal
@@ -19,6 +20,11 @@ from supybot.commands import *
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
 URL_RE = re.compile(r"https?://\S+")
+QUOTA_RESET_RE = re.compile(
+    r"(?:try again|reset(?:s)?|available again)\s+(?:at|after|on|in)\s+"
+    r"([A-Za-z0-9][A-Za-z0-9 ,.:'+-]{0,70})",
+    re.IGNORECASE,
+)
 BULLET_PREFIX_RE = re.compile(r"^\s*[-*•]\s+")
 SKIP_REPLY_LINE_PATTERNS = (
     re.compile(r"^(today is|notable (results|updates)|here('?s| is) (a )?(quick )?(summary|update)|in summary)\b", re.IGNORECASE),
@@ -870,6 +876,66 @@ class Codex(callbacks.Plugin):
 
         return self._truncate(paragraph, max_reply_chars)
 
+    def _friendly_wrapper_error(self, detail):
+        """Map private CLI diagnostics to safe, actionable IRC messages."""
+        detail = str(detail or "")
+        lowered = detail.lower()
+
+        quota_terms = (
+            "usage limit",
+            "rate limit",
+            "quota",
+            "insufficient_quota",
+            "too many requests",
+        )
+        if builtins.any(term in lowered for term in quota_terms):
+            match = QUOTA_RESET_RE.search(detail)
+            if match:
+                reset = match.group(1).split(". ", 1)[0].strip(" .,:;|\t\r\n")
+                if reset:
+                    return f"Codex usage limit reached. Try again after {reset}."
+            return "Codex usage limit reached. Please try again later."
+
+        auth_terms = (
+            "authentication",
+            "not logged in",
+            "login required",
+            "unauthorized",
+            "invalid token",
+            "expired token",
+            "refresh token",
+            "401",
+        )
+        if builtins.any(term in lowered for term in auth_terms):
+            return "Codex authentication needs attention. Nelluk should run codex login."
+
+        if (
+            "model" in lowered
+            and builtins.any(
+                term in lowered
+                for term in ("not found", "unavailable", "unsupported", "does not exist")
+            )
+        ):
+            return "The configured Codex model is currently unavailable. Nelluk has been notified."
+
+        network_terms = (
+            "connection refused",
+            "connection reset",
+            "network",
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "service unavailable",
+            "bad gateway",
+            "502",
+            "503",
+            "504",
+        )
+        if builtins.any(term in lowered for term in network_terms):
+            return "Codex is temporarily unreachable. Please try again in a moment."
+
+        return "Codex request failed. Nelluk has been notified."
+
     def _handle_codex_request(self, irc, msg, prompt, mode=MODE_NORMAL):
         mode = self._normalized_mode(mode)
         query = (prompt or "").strip()
@@ -933,7 +999,7 @@ class Codex(callbacks.Plugin):
             return
         except WrapperExecutionError as exc:
             self.log.warning("Codex wrapper failed: %s", exc)
-            irc.reply("Codex request failed. Please try again in a moment.", prefixNick=False)
+            irc.reply(self._friendly_wrapper_error(exc), prefixNick=False)
             return
         except Exception:
             self.log.exception("Unexpected Codex plugin failure")
