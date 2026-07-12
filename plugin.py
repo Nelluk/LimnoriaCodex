@@ -34,6 +34,8 @@ MODE_NORMAL = "normal"
 MODE_HIGH = "high"
 MODE_LONG = "long"
 MODE_NO = "no"
+MODE_LUNA = "luna"
+MODE_LUNA_HIGH = "lunahigh"
 
 
 class WrapperExecutionError(Exception):
@@ -92,6 +94,10 @@ class Codex(callbacks.Plugin):
 
     def _normalized_mode(self, mode):
         normalized = str(mode or MODE_NORMAL).strip().lower()
+        if normalized == MODE_LUNA_HIGH:
+            return MODE_LUNA_HIGH
+        if normalized == MODE_LUNA:
+            return MODE_LUNA
         if normalized == MODE_NO:
             return MODE_NO
         if normalized == MODE_LONG:
@@ -102,6 +108,10 @@ class Codex(callbacks.Plugin):
 
     def _usage_for_mode(self, mode):
         mode = self._normalized_mode(mode)
+        if mode == MODE_LUNA_HIGH:
+            return "@lunahigh <prompt>"
+        if mode == MODE_LUNA:
+            return "@luna <prompt>"
         if mode == MODE_NO:
             return "@codexno <prompt>"
         if mode == MODE_LONG:
@@ -111,9 +121,12 @@ class Codex(callbacks.Plugin):
         return "@codex <prompt>"
 
     def _wrapper_mode_for_request_mode(self, mode):
-        if self._normalized_mode(mode) in (MODE_LONG, MODE_NO):
+        normalized = self._normalized_mode(mode)
+        if normalized == MODE_LONG:
+            return MODE_LUNA_HIGH
+        if normalized == MODE_NO:
             return MODE_HIGH
-        return self._normalized_mode(mode)
+        return normalized
 
     def _high_reasoning_effort(self):
         return self.HIGH_REASONING_EFFORT
@@ -577,7 +590,7 @@ class Codex(callbacks.Plugin):
                     "Prefer a compact but evidence-aware answer that identifies relevant nicks or time order when useful.",
                 ]
             )
-        elif mode == MODE_HIGH:
+        elif mode in (MODE_HIGH, MODE_LUNA_HIGH):
             instructions.extend(
                 [
                     "Use optional channel context only to resolve ambiguity in the USER QUERY, such as pronouns, follow-up references, named participants, or explicit references to recent chat.",
@@ -807,7 +820,7 @@ class Codex(callbacks.Plugin):
     ):
         mode = self._normalized_mode(mode)
         cmd = [wrapper_path, "--timeout", str(timeout_seconds), "--mode", mode]
-        if mode == MODE_HIGH:
+        if mode in (MODE_HIGH, MODE_LUNA_HIGH):
             cmd.extend(
                 [
                     "--reasoning-effort",
@@ -847,7 +860,11 @@ class Codex(callbacks.Plugin):
         max_reply_chars = self.MAX_REPLY_CHARS
         cleaned = self._sanitize_reply_text(text)
         if not cleaned:
-            return ""
+            match = URL_RE.search(text or "")
+            if not match:
+                return ""
+            first_url = match.group(0).rstrip(".,;:!?)]}")
+            return self._truncate(first_url, max_reply_chars)
 
         lines = [line.strip() for line in cleaned.split("\n") if line.strip()]
         normalized_lines = []
@@ -1058,6 +1075,26 @@ class Codex(callbacks.Plugin):
         self._handle_codex_request(irc, msg, prompt, mode=MODE_HIGH)
 
     codexhigh = wrap(codexhigh, [optional("text")])
+
+    def luna(self, irc, msg, args, prompt):
+        """[<prompt>]
+
+        Sends a stateless prompt to Luna using recent channel context.
+        """
+
+        self._handle_codex_request(irc, msg, prompt, mode=MODE_LUNA)
+
+    luna = wrap(luna, [optional("text")])
+
+    def lunahigh(self, irc, msg, args, prompt):
+        """[<prompt>]
+
+        Sends a higher-effort stateless prompt to Luna using recent channel context.
+        """
+
+        self._handle_codex_request(irc, msg, prompt, mode=MODE_LUNA_HIGH)
+
+    lunahigh = wrap(lunahigh, [optional("text")])
 
     def codexno(self, irc, msg, args, prompt):
         """[<prompt>]

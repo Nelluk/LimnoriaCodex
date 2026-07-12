@@ -117,6 +117,7 @@ Operational defaults in `plugin.py`:
 - Wrapper runtime base: Limnoria data directory for this plugin.
 - `@codexhigh` reasoning effort: `high`
 - `@codexhigh` web search context size: `high`
+- `@luna` and `@lunahigh` use the experimental `gpt-5.6-luna` model.
 - `@codexno` reasoning and web search context settings: same as `@codexhigh`.
 - `@codexlong` context size: 1000 captured lines.
 - `@codexlong` context time format: hourly local markers plus `[HH:MM]` line prefixes.
@@ -129,7 +130,7 @@ Operational defaults in `plugin.py`:
 Codex runtime defaults in `scripts/codex_wrapper.py`:
 
 - Backend: hardened `codex exec`.
-- `model = "gpt-5.6-terra"`
+- Default model: `gpt-5.6-terra`; Luna model: `gpt-5.6-luna`.
 - `model_reasoning_summary = "none"`
 - `model_verbosity = "low"`
 - Hosted web search enabled through `web_search = "live"`.
@@ -142,8 +143,10 @@ Mode-specific defaults:
 
 - `@codex`: `model_reasoning_effort = "medium"`
 - `@codexhigh`: `model_reasoning_effort = "high"`
+- `@luna`: `gpt-5.6-luna` with `model_reasoning_effort = "medium"`
+- `@lunahigh`: `gpt-5.6-luna` with `model_reasoning_effort = "high"`
 - `@codexno`: `model_reasoning_effort = "high"` without prompt context sections.
-- `@codexlong`: `model_reasoning_effort = "high"` with transcript-analysis prompt instructions.
+- `@codexlong`: `gpt-5.6-luna` with `model_reasoning_effort = "high"` and transcript-analysis prompt instructions.
 
 ## Manual Wrapper Test
 

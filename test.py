@@ -125,6 +125,30 @@ class CodexPluginUnitTest(unittest.TestCase):
             ["Please provide a prompt. Usage: @codexhigh <prompt>"],
         )
 
+    def test_empty_prompt_luna_modes(self):
+        self.plugin._handle_codex_request(self.irc, self.msg, "   ", mode="luna")
+        self.assertEqual(self.irc.replies, ["Please provide a prompt. Usage: @luna <prompt>"])
+
+        self.irc.replies.clear()
+        self.plugin._handle_codex_request(self.irc, self.msg, "   ", mode="lunahigh")
+        self.assertEqual(
+            self.irc.replies,
+            ["Please provide a prompt. Usage: @lunahigh <prompt>"],
+        )
+
+    def test_luna_modes_use_expected_prompt_and_wrapper_modes(self):
+        for mode, expects_high in (("luna", False), ("lunahigh", True)):
+            self.irc.replies.clear()
+            with mock.patch.object(self.plugin, "_invoke_wrapper", return_value="Answer") as wrapped:
+                self.plugin._handle_codex_request(self.irc, self.msg, "Compare models", mode=mode)
+
+            self.assertEqual(wrapped.call_args.kwargs["mode"], mode)
+            full_prompt = wrapped.call_args.args[1]
+            self.assertEqual(
+                "Spend extra effort verifying current facts before answering." in full_prompt,
+                expects_high,
+            )
+
     def test_empty_prompt_no_context_mode(self):
         self.plugin._handle_codex_request(self.irc, self.msg, "   ", mode="no")
         self.assertEqual(
@@ -189,7 +213,7 @@ class CodexPluginUnitTest(unittest.TestCase):
         self.assertNotIn("prior q", full_prompt)
         self.assertNotIn("prior a", full_prompt)
 
-    def test_long_mode_uses_long_prompt_and_high_wrapper_mode(self):
+    def test_long_mode_uses_long_prompt_and_luna_high_wrapper_mode(self):
         self.plugin._config["maxContextLines"] = 1
         timestamp = time.mktime((2026, 5, 13, 20, 3, 0, 0, 0, -1))
         with mock.patch.object(codex_plugin.time, "time", return_value=timestamp):
@@ -207,7 +231,7 @@ class CodexPluginUnitTest(unittest.TestCase):
         self.assertEqual(self.irc.replies, ["Answer"])
         full_prompt = wrapped.call_args.args[1]
         self.assertEqual(wrapped.call_args.args[2], 90)
-        self.assertEqual(wrapped.call_args.kwargs["mode"], "high")
+        self.assertEqual(wrapped.call_args.kwargs["mode"], "lunahigh")
         self.assertIn("long-context transcript analysis request", full_prompt)
         self.assertIn("PRIMARY TRANSCRIPT CONTEXT", full_prompt)
         self.assertIn("Answer the USER QUERY above using the primary transcript context.", full_prompt)
@@ -319,6 +343,18 @@ class CodexPluginUnitTest(unittest.TestCase):
         )
         reply = self.plugin._prepare_reply_text(output)
         self.assertEqual(reply, "Result (example) more info")
+
+    def test_url_only_reply_preserves_first_url(self):
+        output = (
+            "https://x.com/example/status/12345\n"
+            "https://example.com/extra-source\n"
+        )
+        reply = self.plugin._prepare_reply_text(output)
+        self.assertEqual(reply, "https://x.com/example/status/12345")
+
+    def test_url_fallback_strips_sentence_punctuation(self):
+        reply = self.plugin._prepare_reply_text("https://example.com/tweet.")
+        self.assertEqual(reply, "https://example.com/tweet")
 
     def test_bulleted_reply_drops_preamble_and_followup(self):
         output = (
@@ -608,13 +644,19 @@ class CodexWrapperUnitTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def test_terra_mode_mappings(self):
+    def test_model_mode_mappings(self):
         normal = codex_wrapper._runtime_settings(codex_wrapper.MODE_NORMAL)
         high = codex_wrapper._runtime_settings(codex_wrapper.MODE_HIGH)
         self.assertEqual(normal["model"], "gpt-5.6-terra")
         self.assertEqual(normal["reasoning_effort"], "medium")
         self.assertEqual(high["model"], "gpt-5.6-terra")
         self.assertEqual(high["reasoning_effort"], "high")
+        luna = codex_wrapper._runtime_settings(codex_wrapper.MODE_LUNA)
+        luna_high = codex_wrapper._runtime_settings(codex_wrapper.MODE_LUNA_HIGH)
+        self.assertEqual(luna["model"], "gpt-5.6-luna")
+        self.assertEqual(luna["reasoning_effort"], "medium")
+        self.assertEqual(luna_high["model"], "gpt-5.6-luna")
+        self.assertEqual(luna_high["reasoning_effort"], "high")
         self.assertNotIn("minimal", codex_wrapper.ALLOWED_REASONING_EFFORTS)
         self.assertIn("none", codex_wrapper.ALLOWED_REASONING_EFFORTS)
         self.assertIn("max", codex_wrapper.ALLOWED_REASONING_EFFORTS)

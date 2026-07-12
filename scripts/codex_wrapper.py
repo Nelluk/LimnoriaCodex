@@ -24,7 +24,9 @@ CANDIDATES_ENV = "CODEX_WRAPPER_CANDIDATES"
 EXEC_CODEX_HOME_ENV = "CODEX_WRAPPER_EXEC_CODEX_HOME"
 MODE_NORMAL = "normal"
 MODE_HIGH = "high"
-ALLOWED_MODES = (MODE_NORMAL, MODE_HIGH)
+MODE_LUNA = "luna"
+MODE_LUNA_HIGH = "lunahigh"
+ALLOWED_MODES = (MODE_NORMAL, MODE_HIGH, MODE_LUNA, MODE_LUNA_HIGH)
 ALLOWED_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 ALLOWED_WEB_SEARCH_CONTEXT_SIZES = ("low", "medium", "high")
 NON_FATAL_ROLLOUT_ERROR = "failed to record rollout items:"
@@ -49,6 +51,18 @@ MODE_PRESETS = {
     },
     MODE_HIGH: {
         "model": "gpt-5.6-terra",
+        "reasoning_effort": "high",
+        "web_search": "live",
+        "web_search_context_size": "high",
+    },
+    MODE_LUNA: {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "medium",
+        "web_search": "live",
+        "web_search_context_size": None,
+    },
+    MODE_LUNA_HIGH: {
+        "model": "gpt-5.6-luna",
         "reasoning_effort": "high",
         "web_search": "live",
         "web_search_context_size": "high",
