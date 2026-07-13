@@ -76,9 +76,12 @@ rules and exposes no local shell or filesystem tool to IRC prompts.
 ## Commands
 
 ```irc
-@codex <prompt>
-@codexhigh <prompt>
-@codexno <prompt>
+@terra <prompt>
+@terrahigh <prompt>
+@terrano <prompt>
+@luna <prompt>
+@lunahigh <prompt>
+@lunano <prompt>
 @codexlong <prompt>
 ```
 
@@ -93,9 +96,10 @@ Behavior summary:
 
 - Each request is stateless.
 - Recent channel or private-message context is included as untrusted context.
-- `@codexhigh` uses a higher-effort Codex preset.
-- `@codexno` uses the higher-effort preset without including channel context or prior Codex memory in the prompt.
+- `@terra`/`@terrahigh` and `@luna`/`@lunahigh` expose medium- and high-reasoning model primitives.
+- `@terrano` and `@lunano` use their model's higher-effort preset without including channel context or prior Codex memory in the prompt.
 - `@codexlong` uses a larger in-memory transcript buffer for channel analysis, with local hour markers and per-line times.
+- The native `codex`, `codexhigh`, and `codexno` names are intentionally free for Aka aliases.
 - Optional persistent memory stores timestamped successful Codex command query/reply pairs per context.
 - Output is sanitized for IRC by stripping markdown, links, control characters, and excess formatting.
 - Only one Codex request runs at a time; concurrent requests are rejected as busy.
@@ -115,10 +119,10 @@ Operational defaults in `plugin.py`:
 
 - Wrapper script: `scripts/codex_wrapper.py`
 - Wrapper runtime base: Limnoria data directory for this plugin.
-- `@codexhigh` reasoning effort: `high`
-- `@codexhigh` web search context size: `high`
+- `@terrahigh` and `@lunahigh` reasoning effort: `high`
+- `@terrahigh` and `@lunahigh` web search context size: `high`
 - `@luna` and `@lunahigh` use the experimental `gpt-5.6-luna` model.
-- `@codexno` reasoning and web search context settings: same as `@codexhigh`.
+- `@terrano` and `@lunano` use the matching model's high reasoning and web search settings.
 - `@codexlong` context size: 1000 captured lines.
 - `@codexlong` context time format: hourly local markers plus `[HH:MM]` line prefixes.
 - Captured IRC line cap: 200 chars per line.
@@ -141,11 +145,12 @@ Codex runtime defaults in `scripts/codex_wrapper.py`:
 
 Mode-specific defaults:
 
-- `@codex`: `model_reasoning_effort = "medium"`
-- `@codexhigh`: `model_reasoning_effort = "high"`
+- `@terra`: `gpt-5.6-terra` with `model_reasoning_effort = "medium"`
+- `@terrahigh`: `gpt-5.6-terra` with `model_reasoning_effort = "high"`
+- `@terrano`: `gpt-5.6-terra` with `model_reasoning_effort = "high"` without prompt context sections.
 - `@luna`: `gpt-5.6-luna` with `model_reasoning_effort = "medium"`
 - `@lunahigh`: `gpt-5.6-luna` with `model_reasoning_effort = "high"`
-- `@codexno`: `model_reasoning_effort = "high"` without prompt context sections.
+- `@lunano`: `gpt-5.6-luna` with `model_reasoning_effort = "high"` without prompt context sections.
 - `@codexlong`: `gpt-5.6-luna` with `model_reasoning_effort = "high"` and transcript-analysis prompt instructions.
 
 ## Manual Wrapper Test
@@ -154,7 +159,7 @@ Default hardened Codex CLI backend using shared `~/.codex` authentication:
 
 ```bash
 printf '%s\n' 'Say hello in one short sentence.' | plugins/Codex/scripts/codex_wrapper.py --timeout 90
-printf '%s\n' 'Verify the latest Fedora release.' | plugins/Codex/scripts/codex_wrapper.py --timeout 90 --mode high
+printf '%s\n' 'Verify the latest Fedora release.' | plugins/Codex/scripts/codex_wrapper.py --timeout 90 --mode terrahigh
 ```
 
 Custom shared Codex home:

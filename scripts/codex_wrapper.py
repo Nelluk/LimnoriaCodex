@@ -22,11 +22,11 @@ OUTPUT_DIR_ENV = "CODEX_WRAPPER_OUTPUT_DIR"
 TEMP_DIR_ENV = "CODEX_WRAPPER_TEMP_DIR"
 CANDIDATES_ENV = "CODEX_WRAPPER_CANDIDATES"
 EXEC_CODEX_HOME_ENV = "CODEX_WRAPPER_EXEC_CODEX_HOME"
-MODE_NORMAL = "normal"
-MODE_HIGH = "high"
+MODE_TERRA = "terra"
+MODE_TERRA_HIGH = "terrahigh"
 MODE_LUNA = "luna"
 MODE_LUNA_HIGH = "lunahigh"
-ALLOWED_MODES = (MODE_NORMAL, MODE_HIGH, MODE_LUNA, MODE_LUNA_HIGH)
+ALLOWED_MODES = (MODE_TERRA, MODE_TERRA_HIGH, MODE_LUNA, MODE_LUNA_HIGH)
 ALLOWED_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 ALLOWED_WEB_SEARCH_CONTEXT_SIZES = ("low", "medium", "high")
 NON_FATAL_ROLLOUT_ERROR = "failed to record rollout items:"
@@ -43,13 +43,13 @@ EXEC_DISABLED_FEATURES = (
     "skill_mcp_dependency_install",
 )
 MODE_PRESETS = {
-    MODE_NORMAL: {
+    MODE_TERRA: {
         "model": "gpt-5.6-terra",
         "reasoning_effort": "medium",
         "web_search": "live",
         "web_search_context_size": None,
     },
-    MODE_HIGH: {
+    MODE_TERRA_HIGH: {
         "model": "gpt-5.6-terra",
         "reasoning_effort": "high",
         "web_search": "live",
@@ -95,7 +95,7 @@ def _resolve_timeout(cli_timeout):
 
 
 def _runtime_settings(mode, reasoning_effort=None, web_search_context_size=None):
-    normalized_mode = str(mode or MODE_NORMAL).strip().lower()
+    normalized_mode = str(mode or MODE_TERRA).strip().lower()
     if normalized_mode not in ALLOWED_MODES:
         raise RuntimeError(f"unsupported mode: {mode}")
 
@@ -524,7 +524,7 @@ def main():
     parser.add_argument(
         "--mode",
         choices=ALLOWED_MODES,
-        default=MODE_NORMAL,
+        default=MODE_TERRA,
         help="Execution preset to use for the Codex request.",
     )
     parser.add_argument(

@@ -98,6 +98,12 @@ class CodexPluginUnitTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
+    def test_model_primitives_leave_aka_names_free(self):
+        for name in ("terra", "terrahigh", "terrano", "luna", "lunahigh", "lunano"):
+            self.assertTrue(callable(getattr(self.plugin, name)))
+        for name in ("codex", "codexhigh", "codexno"):
+            self.assertFalse(hasattr(Codex, name))
+
     def test_success_path(self):
         with mock.patch.object(self.plugin, "_invoke_wrapper", return_value="Answer") as wrapped:
             self.plugin._handle_codex_request(self.irc, self.msg, "What is 2+2?")
@@ -112,17 +118,17 @@ class CodexPluginUnitTest(unittest.TestCase):
         self.assertIn("Never run shell/system commands", full_prompt)
         self.assertIn("USER QUERY:\nWhat is 2+2?", full_prompt)
         self.assertEqual(wrapped.call_args.args[2], 90)
-        self.assertEqual(wrapped.call_args.kwargs["mode"], "normal")
+        self.assertEqual(wrapped.call_args.kwargs["mode"], "terra")
 
     def test_empty_prompt(self):
         self.plugin._handle_codex_request(self.irc, self.msg, "   ")
-        self.assertEqual(self.irc.replies, ["Please provide a prompt. Usage: @codex <prompt>"])
+        self.assertEqual(self.irc.replies, ["Please provide a prompt. Usage: @terra <prompt>"])
 
     def test_empty_prompt_high_mode(self):
-        self.plugin._handle_codex_request(self.irc, self.msg, "   ", mode="high")
+        self.plugin._handle_codex_request(self.irc, self.msg, "   ", mode="terrahigh")
         self.assertEqual(
             self.irc.replies,
-            ["Please provide a prompt. Usage: @codexhigh <prompt>"],
+            ["Please provide a prompt. Usage: @terrahigh <prompt>"],
         )
 
     def test_empty_prompt_luna_modes(self):
@@ -149,12 +155,14 @@ class CodexPluginUnitTest(unittest.TestCase):
                 expects_high,
             )
 
-    def test_empty_prompt_no_context_mode(self):
-        self.plugin._handle_codex_request(self.irc, self.msg, "   ", mode="no")
-        self.assertEqual(
-            self.irc.replies,
-            ["Please provide a prompt. Usage: @codexno <prompt>"],
-        )
+    def test_empty_prompt_no_context_modes(self):
+        for mode in ("terrano", "lunano"):
+            self.irc.replies.clear()
+            self.plugin._handle_codex_request(self.irc, self.msg, "   ", mode=mode)
+            self.assertEqual(
+                self.irc.replies,
+                [f"Please provide a prompt. Usage: @{mode} <prompt>"],
+            )
 
     def test_empty_prompt_long_mode(self):
         self.plugin._handle_codex_request(self.irc, self.msg, "   ", mode="long")
@@ -169,13 +177,13 @@ class CodexPluginUnitTest(unittest.TestCase):
                 self.irc,
                 self.msg,
                 "What changed this week?",
-                mode="high",
+                mode="terrahigh",
             )
 
         self.assertEqual(self.irc.replies, ["Answer"])
         full_prompt = wrapped.call_args.args[1]
         self.assertEqual(wrapped.call_args.args[2], 90)
-        self.assertEqual(wrapped.call_args.kwargs["mode"], "high")
+        self.assertEqual(wrapped.call_args.kwargs["mode"], "terrahigh")
         self.assertIn("OPTIONAL INCIDENTAL CHANNEL CONTEXT", full_prompt)
         self.assertIn("ignore optional channel context entirely", full_prompt)
         self.assertIn("Spend extra effort verifying current facts before answering.", full_prompt)
@@ -183,35 +191,34 @@ class CodexPluginUnitTest(unittest.TestCase):
         self.assertIn("Use multiple searches when needed", full_prompt)
         self.assertNotIn("Use one brief search pass", full_prompt)
 
-    def test_no_context_mode_uses_high_wrapper_without_context_sections(self):
+    def test_no_context_modes_use_matching_high_wrapper_without_context_sections(self):
         self.plugin._config["persistentMemoryEnabled"] = True
         timestamp = time.mktime((2026, 5, 13, 20, 3, 0, 0, 0, -1))
         with mock.patch.object(codex_plugin.time, "time", return_value=timestamp):
             self.plugin.doPrivmsg(self.irc, FakeMsg("alice", "#test", "nearby channel detail"))
             self.plugin._record_persistent_exchange("#test", "prior q", "prior a", None)
 
-        with mock.patch.object(self.plugin, "_invoke_wrapper", return_value="Answer") as wrapped:
-            self.plugin._handle_codex_request(
-                self.irc,
-                self.msg,
-                "What changed this week?",
-                mode="no",
-            )
+        for mode, wrapper_mode in (("terrano", "terrahigh"), ("lunano", "lunahigh")):
+            self.irc.replies.clear()
+            with mock.patch.object(self.plugin, "_invoke_wrapper", return_value="Answer") as wrapped:
+                self.plugin._handle_codex_request(
+                    self.irc,
+                    self.msg,
+                    "What changed this week?",
+                    mode=mode,
+                )
 
-        self.assertEqual(self.irc.replies, ["Answer"])
-        full_prompt = wrapped.call_args.args[1]
-        self.assertEqual(wrapped.call_args.args[2], 90)
-        self.assertEqual(wrapped.call_args.kwargs["mode"], "high")
-        self.assertIn("No channel lines or prior Codex exchanges are provided", full_prompt)
-        self.assertIn("Spend extra effort verifying current facts before answering.", full_prompt)
-        self.assertIn("Answer the USER QUERY above directly.", full_prompt)
-        self.assertIn("USER QUERY:\nWhat changed this week?", full_prompt)
-        self.assertNotIn("RECENT CODEX EXCHANGES", full_prompt)
-        self.assertNotIn("OPTIONAL INCIDENTAL CHANNEL CONTEXT", full_prompt)
-        self.assertNotIn("PRIMARY TRANSCRIPT CONTEXT", full_prompt)
-        self.assertNotIn("nearby channel detail", full_prompt)
-        self.assertNotIn("prior q", full_prompt)
-        self.assertNotIn("prior a", full_prompt)
+            self.assertEqual(self.irc.replies, ["Answer"])
+            full_prompt = wrapped.call_args.args[1]
+            self.assertEqual(wrapped.call_args.args[2], 90)
+            self.assertEqual(wrapped.call_args.kwargs["mode"], wrapper_mode)
+            self.assertIn("No channel lines or prior Codex exchanges are provided", full_prompt)
+            self.assertIn("Spend extra effort verifying current facts before answering.", full_prompt)
+            self.assertIn("Answer the USER QUERY above directly.", full_prompt)
+            self.assertNotIn("RECENT CODEX EXCHANGES", full_prompt)
+            self.assertNotIn("OPTIONAL INCIDENTAL CHANNEL CONTEXT", full_prompt)
+            self.assertNotIn("nearby channel detail", full_prompt)
+            self.assertNotIn("prior q", full_prompt)
 
     def test_long_mode_uses_long_prompt_and_luna_high_wrapper_mode(self):
         self.plugin._config["maxContextLines"] = 1
@@ -495,7 +502,7 @@ class CodexPluginUnitTest(unittest.TestCase):
                     self.irc,
                     self.msg,
                     "no-context question?",
-                    mode="no",
+                    mode="terrano",
                 )
 
         with mock.patch.object(codex_plugin.time, "time", return_value=timestamp):
@@ -586,13 +593,13 @@ class CodexPluginUnitTest(unittest.TestCase):
                 "prompt text",
                 42,
                 self.plugin._resolve_runtime_write_paths(),
-                mode="normal",
+                mode="terra",
             )
 
         self.assertEqual(output, "wrapper output")
         self.assertEqual(
             run_mock.call_args.args[0],
-            ["/tmp/wrapper", "--timeout", "42", "--mode", "normal"],
+            ["/tmp/wrapper", "--timeout", "42", "--mode", "terra"],
         )
         self.assertEqual(run_mock.call_args.args[1], "prompt text")
         self.assertIn("CODEX_WRAPPER_WRITE_BASE", run_mock.call_args.args[2])
@@ -606,13 +613,13 @@ class CodexPluginUnitTest(unittest.TestCase):
                 "prompt text",
                 42,
                 self.plugin._resolve_runtime_write_paths(),
-                mode="high",
+                mode="terrahigh",
             )
 
         self.assertEqual(output, "wrapper output")
         cmd = run_mock.call_args.args[0]
         self.assertEqual(cmd[:4], ["/tmp/wrapper", "--timeout", "42", "--mode"])
-        self.assertIn("high", cmd)
+        self.assertIn("terrahigh", cmd)
         self.assertIn("--reasoning-effort", cmd)
         self.assertIn("--web-search-context-size", cmd)
         self.assertEqual(cmd[cmd.index("--reasoning-effort") + 1], "high")
@@ -629,7 +636,7 @@ class CodexPluginUnitTest(unittest.TestCase):
                     "prompt",
                     5,
                     self.plugin._resolve_runtime_write_paths(),
-                    mode="normal",
+                    mode="terra",
                 )
 
 
@@ -645,12 +652,12 @@ class CodexWrapperUnitTest(unittest.TestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_model_mode_mappings(self):
-        normal = codex_wrapper._runtime_settings(codex_wrapper.MODE_NORMAL)
-        high = codex_wrapper._runtime_settings(codex_wrapper.MODE_HIGH)
-        self.assertEqual(normal["model"], "gpt-5.6-terra")
-        self.assertEqual(normal["reasoning_effort"], "medium")
-        self.assertEqual(high["model"], "gpt-5.6-terra")
-        self.assertEqual(high["reasoning_effort"], "high")
+        terra = codex_wrapper._runtime_settings(codex_wrapper.MODE_TERRA)
+        terra_high = codex_wrapper._runtime_settings(codex_wrapper.MODE_TERRA_HIGH)
+        self.assertEqual(terra["model"], "gpt-5.6-terra")
+        self.assertEqual(terra["reasoning_effort"], "medium")
+        self.assertEqual(terra_high["model"], "gpt-5.6-terra")
+        self.assertEqual(terra_high["reasoning_effort"], "high")
         luna = codex_wrapper._runtime_settings(codex_wrapper.MODE_LUNA)
         luna_high = codex_wrapper._runtime_settings(codex_wrapper.MODE_LUNA_HIGH)
         self.assertEqual(luna["model"], "gpt-5.6-luna")
@@ -764,7 +771,7 @@ class CodexWrapperUnitTest(unittest.TestCase):
         self.assertNotIn("CODEX_THREAD_ID", child_env)
 
     def test_exec_command_is_ephemeral_strict_and_tool_disabled(self):
-        settings = codex_wrapper._runtime_settings(codex_wrapper.MODE_HIGH)
+        settings = codex_wrapper._runtime_settings(codex_wrapper.MODE_TERRA_HIGH)
         layout = {"agent_cwd": os.path.join(self.tmpdir, "agent-cwd")}
         cmd = codex_wrapper._exec_command(
             "/opt/codex/bin/codex",

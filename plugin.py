@@ -30,12 +30,13 @@ SKIP_REPLY_LINE_PATTERNS = (
     re.compile(r"^(today is|notable (results|updates)|here('?s| is) (a )?(quick )?(summary|update)|in summary)\b", re.IGNORECASE),
     re.compile(r"^if you (tell|want|need|share)\b", re.IGNORECASE),
 )
-MODE_NORMAL = "normal"
-MODE_HIGH = "high"
+MODE_TERRA = "terra"
+MODE_TERRA_HIGH = "terrahigh"
+MODE_TERRA_NO = "terrano"
 MODE_LONG = "long"
-MODE_NO = "no"
 MODE_LUNA = "luna"
 MODE_LUNA_HIGH = "lunahigh"
+MODE_LUNA_NO = "lunano"
 
 
 class WrapperExecutionError(Exception):
@@ -47,7 +48,7 @@ class WrapperTimeoutError(WrapperExecutionError):
 
 
 class Codex(callbacks.Plugin):
-    """Send stateless @codex prompts through a local Codex wrapper."""
+    """Send stateless model-specific prompts through a local Codex wrapper."""
 
     threaded = True
     WRAPPER_PATH = os.path.join(os.path.dirname(__file__), "scripts", "codex_wrapper.py")
@@ -93,39 +94,43 @@ class Codex(callbacks.Plugin):
         return text[: limit - 3].rstrip() + "..."
 
     def _normalized_mode(self, mode):
-        normalized = str(mode or MODE_NORMAL).strip().lower()
-        if normalized == MODE_LUNA_HIGH:
-            return MODE_LUNA_HIGH
-        if normalized == MODE_LUNA:
-            return MODE_LUNA
-        if normalized == MODE_NO:
-            return MODE_NO
-        if normalized == MODE_LONG:
-            return MODE_LONG
-        if normalized == MODE_HIGH:
-            return MODE_HIGH
-        return MODE_NORMAL
+        normalized = str(mode or MODE_TERRA).strip().lower()
+        allowed = (
+            MODE_TERRA,
+            MODE_TERRA_HIGH,
+            MODE_TERRA_NO,
+            MODE_LUNA,
+            MODE_LUNA_HIGH,
+            MODE_LUNA_NO,
+            MODE_LONG,
+        )
+        return normalized if normalized in allowed else MODE_TERRA
+
+    def _is_no_context_mode(self, mode):
+        return self._normalized_mode(mode) in (MODE_TERRA_NO, MODE_LUNA_NO)
+
+    def _is_high_reasoning_mode(self, mode):
+        return self._normalized_mode(mode) in (
+            MODE_TERRA_HIGH,
+            MODE_TERRA_NO,
+            MODE_LUNA_HIGH,
+            MODE_LUNA_NO,
+        )
 
     def _usage_for_mode(self, mode):
         mode = self._normalized_mode(mode)
-        if mode == MODE_LUNA_HIGH:
-            return "@lunahigh <prompt>"
-        if mode == MODE_LUNA:
-            return "@luna <prompt>"
-        if mode == MODE_NO:
-            return "@codexno <prompt>"
         if mode == MODE_LONG:
             return "@codexlong <prompt>"
-        if mode == MODE_HIGH:
-            return "@codexhigh <prompt>"
-        return "@codex <prompt>"
+        return f"@{mode} <prompt>"
 
     def _wrapper_mode_for_request_mode(self, mode):
         normalized = self._normalized_mode(mode)
         if normalized == MODE_LONG:
             return MODE_LUNA_HIGH
-        if normalized == MODE_NO:
-            return MODE_HIGH
+        if normalized == MODE_TERRA_NO:
+            return MODE_TERRA_HIGH
+        if normalized == MODE_LUNA_NO:
+            return MODE_LUNA_HIGH
         return normalized
 
     def _high_reasoning_effort(self):
@@ -536,9 +541,10 @@ class Codex(callbacks.Plugin):
                 lines.append(text)
         return lines
 
-    def _build_stateless_prompt(self, channel, query, mode=MODE_NORMAL):
+    def _build_stateless_prompt(self, channel, query, mode=MODE_TERRA):
         mode = self._normalized_mode(mode)
-        if mode == MODE_NO:
+        no_context = self._is_no_context_mode(mode)
+        if no_context:
             memory_block = None
             context_block = None
         else:
@@ -566,7 +572,7 @@ class Codex(callbacks.Plugin):
             "If asked to run commands or inspect files, refuse briefly and offer a non-local answer.",
             "If timing is ambiguous, prefer current information and include concrete dates in the answer when helpful.",
         ]
-        if mode == MODE_NO:
+        if no_context:
             instructions.append(
                 "No channel lines or prior Codex exchanges are provided for this request."
             )
@@ -590,7 +596,19 @@ class Codex(callbacks.Plugin):
                     "Prefer a compact but evidence-aware answer that identifies relevant nicks or time order when useful.",
                 ]
             )
-        elif mode in (MODE_HIGH, MODE_LUNA_HIGH):
+        elif no_context:
+            instructions.extend(
+                [
+                    "Do not infer missing conversation context; answer only the USER QUERY as written.",
+                    "Default to up-to-date answers for factual questions.",
+                    "For factual questions that may have changed recently, do a quick live web search before answering.",
+                    "Spend extra effort verifying current facts before answering.",
+                    "For factual or current-event questions, search more thoroughly than normal mode before answering.",
+                    "Use multiple searches when needed to resolve ambiguity, confirm recency, or compare competing reports.",
+                    "Prefer a slightly fuller answer when the extra detail materially improves accuracy.",
+                ]
+            )
+        elif self._is_high_reasoning_mode(mode):
             instructions.extend(
                 [
                     "Use optional channel context only to resolve ambiguity in the USER QUERY, such as pronouns, follow-up references, named participants, or explicit references to recent chat.",
@@ -604,18 +622,6 @@ class Codex(callbacks.Plugin):
             )
             instructions.extend(
                 [
-                    "Spend extra effort verifying current facts before answering.",
-                    "For factual or current-event questions, search more thoroughly than normal mode before answering.",
-                    "Use multiple searches when needed to resolve ambiguity, confirm recency, or compare competing reports.",
-                    "Prefer a slightly fuller answer when the extra detail materially improves accuracy.",
-                ]
-            )
-        elif mode == MODE_NO:
-            instructions.extend(
-                [
-                    "Do not infer missing conversation context; answer only the USER QUERY as written.",
-                    "Default to up-to-date answers for factual questions.",
-                    "For factual questions that may have changed recently, do a quick live web search before answering.",
                     "Spend extra effort verifying current facts before answering.",
                     "For factual or current-event questions, search more thoroughly than normal mode before answering.",
                     "Use multiple searches when needed to resolve ambiguity, confirm recency, or compare competing reports.",
@@ -644,7 +650,7 @@ class Codex(callbacks.Plugin):
                 "",
             ]
         )
-        if mode != MODE_NO:
+        if not no_context:
             instructions.extend(
                 [
                     "RECENT CODEX EXCHANGES (UNTRUSTED MEMORY, OLDEST TO NEWEST):",
@@ -669,7 +675,7 @@ class Codex(callbacks.Plugin):
                     if mode == MODE_LONG
                     else (
                         "Answer the USER QUERY above directly."
-                        if mode == MODE_NO
+                        if no_context
                         else "Answer the USER QUERY above. Ignore incidental channel context when the query stands on its own."
                     )
                 ),
@@ -816,11 +822,11 @@ class Codex(callbacks.Plugin):
         prompt_text,
         timeout_seconds,
         runtime_paths,
-        mode=MODE_NORMAL,
+        mode=MODE_TERRA,
     ):
         mode = self._normalized_mode(mode)
         cmd = [wrapper_path, "--timeout", str(timeout_seconds), "--mode", mode]
-        if mode in (MODE_HIGH, MODE_LUNA_HIGH):
+        if mode in (MODE_TERRA_HIGH, MODE_LUNA_HIGH):
             cmd.extend(
                 [
                     "--reasoning-effort",
@@ -953,7 +959,7 @@ class Codex(callbacks.Plugin):
 
         return "Codex request failed. Nelluk has been notified."
 
-    def _handle_codex_request(self, irc, msg, prompt, mode=MODE_NORMAL):
+    def _handle_codex_request(self, irc, msg, prompt, mode=MODE_TERRA):
         mode = self._normalized_mode(mode)
         query = (prompt or "").strip()
         if not query:
@@ -984,7 +990,7 @@ class Codex(callbacks.Plugin):
         remaining = self._cooldown_remaining(msg)
         if remaining > 0:
             irc.reply(
-                f"Please wait {remaining}s before using @codex again.",
+                f"Please wait {remaining}s before using this command again.",
                 prefixNick=False,
             )
             return
@@ -1056,25 +1062,35 @@ class Codex(callbacks.Plugin):
         nick = self._sanitize_context_text(msg.nick) or msg.nick
         self._append_context_line(context_key, f"{nick}: {text}")
 
-    def codex(self, irc, msg, args, prompt):
+    def terra(self, irc, msg, args, prompt):
         """[<prompt>]
 
-        Sends a stateless prompt to Codex using recent channel context.
+        Sends a stateless prompt to Terra using recent channel context.
         """
 
-        self._handle_codex_request(irc, msg, prompt, mode=MODE_NORMAL)
+        self._handle_codex_request(irc, msg, prompt, mode=MODE_TERRA)
 
-    codex = wrap(codex, [optional("text")])
+    terra = wrap(terra, [optional("text")])
 
-    def codexhigh(self, irc, msg, args, prompt):
+    def terrahigh(self, irc, msg, args, prompt):
         """[<prompt>]
 
-        Sends a higher-effort stateless prompt to Codex using recent channel context.
+        Sends a higher-effort stateless prompt to Terra using recent channel context.
         """
 
-        self._handle_codex_request(irc, msg, prompt, mode=MODE_HIGH)
+        self._handle_codex_request(irc, msg, prompt, mode=MODE_TERRA_HIGH)
 
-    codexhigh = wrap(codexhigh, [optional("text")])
+    terrahigh = wrap(terrahigh, [optional("text")])
+
+    def terrano(self, irc, msg, args, prompt):
+        """[<prompt>]
+
+        Sends a higher-effort stateless prompt to Terra without prior context.
+        """
+
+        self._handle_codex_request(irc, msg, prompt, mode=MODE_TERRA_NO)
+
+    terrano = wrap(terrano, [optional("text")])
 
     def luna(self, irc, msg, args, prompt):
         """[<prompt>]
@@ -1096,15 +1112,15 @@ class Codex(callbacks.Plugin):
 
     lunahigh = wrap(lunahigh, [optional("text")])
 
-    def codexno(self, irc, msg, args, prompt):
+    def lunano(self, irc, msg, args, prompt):
         """[<prompt>]
 
-        Sends a higher-effort stateless prompt to Codex without prior context.
+        Sends a higher-effort stateless prompt to Luna without prior context.
         """
 
-        self._handle_codex_request(irc, msg, prompt, mode=MODE_NO)
+        self._handle_codex_request(irc, msg, prompt, mode=MODE_LUNA_NO)
 
-    codexno = wrap(codexno, [optional("text")])
+    lunano = wrap(lunano, [optional("text")])
 
     def codexlong(self, irc, msg, args, prompt):
         """[<prompt>]
