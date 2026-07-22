@@ -363,7 +363,7 @@ class CodexPluginUnitTest(unittest.TestCase):
         reply = self.plugin._prepare_reply_text("https://example.com/tweet.")
         self.assertEqual(reply, "https://example.com/tweet")
 
-    def test_bulleted_reply_drops_preamble_and_followup(self):
+    def test_bulleted_reply_preserves_content(self):
         output = (
             "Today is Tuesday.\n"
             "Notable updates:\n"
@@ -372,7 +372,11 @@ class CodexPluginUnitTest(unittest.TestCase):
             "If you tell me a team, I can narrow it down.\n"
         )
         reply = self.plugin._prepare_reply_text(output)
-        self.assertEqual(reply, "one two")
+        self.assertEqual(
+            reply,
+            "Today is Tuesday. Notable updates: one two "
+            "If you tell me a team, I can narrow it down.",
+        )
 
     def test_context_ring_buffer_behavior(self):
         self.plugin._config["maxContextLines"] = 3

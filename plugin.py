@@ -26,10 +26,6 @@ QUOTA_RESET_RE = re.compile(
     re.IGNORECASE,
 )
 BULLET_PREFIX_RE = re.compile(r"^\s*[-*•]\s+")
-SKIP_REPLY_LINE_PATTERNS = (
-    re.compile(r"^(today is|notable (results|updates)|here('?s| is) (a )?(quick )?(summary|update)|in summary)\b", re.IGNORECASE),
-    re.compile(r"^if you (tell|want|need|share)\b", re.IGNORECASE),
-)
 MODE_TERRA = "terra"
 MODE_TERRA_HIGH = "terrahigh"
 MODE_TERRA_NO = "terrano"
@@ -645,8 +641,11 @@ class Codex(callbacks.Plugin):
         instructions.extend(
             [
                 "Output plain IRC-safe text only: no markdown, no links, no citations, no bold/italics.",
+                "Keep the entire response on one IRC-safe line.",
                 "Do not include a preamble or follow-up question.",
                 "Prefer a direct answer in 1-3 short sentences; add detail only when needed for correctness.",
+                "Honor the user's requested output format and include every requested item; these requirements override the sentence preference.",
+                "For lists, separate entries with semicolons so the complete list remains readable on one line.",
                 "",
             ]
         )
@@ -872,30 +871,14 @@ class Codex(callbacks.Plugin):
             first_url = match.group(0).rstrip(".,;:!?)]}")
             return self._truncate(first_url, max_reply_chars)
 
-        lines = [line.strip() for line in cleaned.split("\n") if line.strip()]
-        normalized_lines = []
-        for line in lines:
-            line = BULLET_PREFIX_RE.sub("", line)
-            if not line:
-                continue
-            should_skip = False
-            for pattern in SKIP_REPLY_LINE_PATTERNS:
-                if pattern.match(line):
-                    should_skip = True
-                    break
-            if should_skip:
-                continue
-            normalized_lines.append(line)
-
-        paragraph = re.sub(r"\s+", " ", " ".join(normalized_lines)).strip()
-        if not paragraph:
-            paragraph = re.sub(r"\s+", " ", cleaned).strip()
+        lines = [
+            BULLET_PREFIX_RE.sub("", line.strip())
+            for line in cleaned.split("\n")
+            if line.strip()
+        ]
+        paragraph = re.sub(r"\s+", " ", " ".join(lines)).strip()
         if not paragraph:
             return ""
-
-        sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", paragraph) if part.strip()]
-        if sentences:
-            paragraph = " ".join(sentences[:5])
 
         return self._truncate(paragraph, max_reply_chars)
 
