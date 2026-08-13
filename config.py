@@ -23,6 +23,24 @@ conf.registerGlobalValue(
 
 conf.registerGlobalValue(
     Codex,
+    "deepTimeoutSeconds",
+    registry.PositiveInteger(
+        180,
+        """Maximum time in seconds allowed for one Codex deep-log request.""",
+    ),
+)
+
+conf.registerGlobalValue(
+    Codex,
+    "deepLogRoot",
+    registry.String(
+        "",
+        """ChannelLogger root containing network/channel directories. Empty uses the Limnoria log directory.""",
+    ),
+)
+
+conf.registerGlobalValue(
+    Codex,
     "maxContextLines",
     registry.PositiveInteger(
         20,

@@ -26,7 +26,8 @@ MODE_TERRA = "terra"
 MODE_TERRA_HIGH = "terrahigh"
 MODE_LUNA = "luna"
 MODE_LUNA_HIGH = "lunahigh"
-ALLOWED_MODES = (MODE_TERRA, MODE_TERRA_HIGH, MODE_LUNA, MODE_LUNA_HIGH)
+MODE_DEEP = "deep"
+ALLOWED_MODES = (MODE_TERRA, MODE_TERRA_HIGH, MODE_LUNA, MODE_LUNA_HIGH, MODE_DEEP)
 ALLOWED_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 ALLOWED_WEB_SEARCH_CONTEXT_SIZES = ("low", "medium", "high")
 NON_FATAL_ROLLOUT_ERROR = "failed to record rollout items:"
@@ -67,7 +68,17 @@ MODE_PRESETS = {
         "web_search": "live",
         "web_search_context_size": "high",
     },
+    MODE_DEEP: {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "high",
+        "web_search": "disabled",
+        "web_search_context_size": None,
+        "deep_logs": True,
+    },
 }
+
+DEEP_TOOLS_PATH = os.path.join(os.path.dirname(__file__), "deep_log_tools.py")
+DEEP_TOOL_NAMES = ("list_log_files", "search_logs", "read_log_lines")
 
 
 def _positive_int(value):
@@ -220,7 +231,7 @@ def _resolve_exec_codex_home():
     return code_home
 
 
-def _codex_child_env(codex_binary, layout, code_home):
+def _codex_child_env(codex_binary, layout, code_home, deep_log_dir=None):
     inherited_keys = (
         "HOME",
         "USER",
@@ -247,7 +258,13 @@ def _codex_child_env(codex_binary, layout, code_home):
     run_env.setdefault("TERM", "dumb")
     run_env.setdefault("NO_COLOR", "1")
     run_env["PWD"] = layout["agent_cwd"]
+    if deep_log_dir:
+        run_env["CODEX_DEEP_LOG_DIR"] = deep_log_dir
     return run_env
+
+
+def _toml_string(value):
+    return json.dumps(str(value), ensure_ascii=True)
 
 
 def _exec_command(codex_binary, settings, layout, output_path):
@@ -287,6 +304,29 @@ def _exec_command(codex_binary, settings, layout, output_path):
     ]
     for feature in EXEC_DISABLED_FEATURES:
         cmd.extend(("-c", f"features.{feature}=false"))
+
+    if settings.get("deep_logs"):
+        enabled_tools = ",".join(_toml_string(name) for name in DEEP_TOOL_NAMES)
+        cmd.extend(
+            (
+                "-c",
+                f"mcp_servers.channel_logs.command={_toml_string(sys.executable)}",
+                "-c",
+                f"mcp_servers.channel_logs.args=[{_toml_string(DEEP_TOOLS_PATH)}]",
+                "-c",
+                'mcp_servers.channel_logs.env_vars=["CODEX_DEEP_LOG_DIR"]',
+                "-c",
+                "mcp_servers.channel_logs.required=true",
+                "-c",
+                f"mcp_servers.channel_logs.enabled_tools=[{enabled_tools}]",
+                "-c",
+                'mcp_servers.channel_logs.default_tools_approval_mode="approve"',
+                "-c",
+                "mcp_servers.channel_logs.startup_timeout_sec=10",
+                "-c",
+                "mcp_servers.channel_logs.tool_timeout_sec=30",
+            )
+        )
 
     context_size = settings.get("web_search_context_size")
     if context_size:
@@ -508,6 +548,17 @@ def _resolve_write_layout():
     raise RuntimeError(f"runtime write-path preflight failed: {detail}")
 
 
+def _resolve_deep_log_dir(configured):
+    if not configured:
+        raise RuntimeError("deep mode requires --log-dir")
+    resolved = os.path.realpath(os.path.abspath(os.path.expanduser(configured)))
+    if not os.path.isdir(resolved) or not os.access(resolved, os.R_OK | os.X_OK):
+        raise RuntimeError("deep log directory is not readable")
+    if not os.path.isfile(DEEP_TOOLS_PATH):
+        raise RuntimeError("deep log tools are unavailable")
+    return resolved
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Run one Codex request with fixed production settings.",
@@ -539,6 +590,11 @@ def main():
         default=None,
         help="Optional web search context size override for the selected mode.",
     )
+    parser.add_argument(
+        "--log-dir",
+        default=None,
+        help="Prevalidated current-channel log directory; required only in deep mode.",
+    )
     args = parser.parse_args()
 
     timeout_seconds = _resolve_timeout(args.timeout)
@@ -547,6 +603,17 @@ def main():
         reasoning_effort=args.reasoning_effort,
         web_search_context_size=args.web_search_context_size,
     )
+    if args.mode == MODE_DEEP:
+        try:
+            deep_log_dir = _resolve_deep_log_dir(args.log_dir)
+        except RuntimeError as exc:
+            print(str(exc)[:300], file=sys.stderr)
+            return 125
+    else:
+        if args.log_dir:
+            print("--log-dir is valid only in deep mode", file=sys.stderr)
+            return 2
+        deep_log_dir = None
     prompt_text = sys.stdin.read()
     if not prompt_text.strip():
         print("empty prompt", file=sys.stderr)
@@ -581,6 +648,7 @@ def main():
                 codex_binary,
                 layout,
                 code_home=exec_code_home,
+                deep_log_dir=deep_log_dir,
             )
             _append_debug_line(
                 layout,

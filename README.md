@@ -32,6 +32,7 @@ chmod +x plugins/Codex/scripts/codex_wrapper.py
 
 ```irc
 @config plugins.codex.timeoutSeconds 90
+@config plugins.codex.deepTimeoutSeconds 180
 @config plugins.codex.maxContextLines 20
 @config plugins.codex.persistentMemoryEnabled false
 @config plugins.codex.memoryMaxExchanges 8
@@ -44,6 +45,14 @@ Optional channel allowlist:
 @config plugins.codex.allowedChannels "#example #bots"
 ```
 
+`@codexdeep` derives its archive from the current network and channel beneath
+Limnoria's `logs/ChannelLogger` directory. Override only the ChannelLogger root
+when the deployment stores it elsewhere:
+
+```irc
+@config plugins.codex.deepLogRoot /path/to/logs/ChannelLogger
+```
+
 ## Authentication
 
 The default `exec` backend uses the normal shared Codex home at `~/.codex`.
@@ -54,9 +63,11 @@ official CLI to read and refresh that shared authentication; it does not copy
 Exec requests ignore shared user configuration and rules, run without persisted
 session files, and use an empty plugin-owned working directory. Local shell,
 apps, plugins, hooks, browser/computer use, memories, and multi-agent features
-are disabled. Hosted web search remains available.
+are disabled. Hosted web search remains available for ordinary modes. Deep
+mode disables web search and exposes only three read-only, path-confined log
+tools through a plugin-owned local MCP server.
 
-The current deployment is validated with `codex-cli 0.144.1`.
+The current deployment is validated with `codex-cli 0.147.0`.
 
 ### systemd deployment
 
@@ -71,7 +82,8 @@ ReadWritePaths=/home/nelluk/.codex
 
 Then run `systemctl daemon-reload` and restart the bot service. Other home paths
 remain read-only. The Codex child still ignores shared user configuration and
-rules and exposes no local shell or filesystem tool to IRC prompts.
+rules and exposes no general local shell or filesystem tool to IRC prompts.
+Deep mode adds only its path-confined, read-only channel-log tools.
 
 ## Commands
 
@@ -83,6 +95,7 @@ rules and exposes no local shell or filesystem tool to IRC prompts.
 @lunahigh <prompt>
 @lunano <prompt>
 @codexlong <prompt>
+@codexdeep <prompt>
 ```
 
 Owner-only memory commands:
@@ -99,6 +112,8 @@ Behavior summary:
 - `@terra`/`@terrahigh` and `@luna`/`@lunahigh` expose medium- and high-reasoning model primitives.
 - `@terrano` and `@lunano` use their model's higher-effort preset without including channel context or prior Codex memory in the prompt.
 - `@codexlong` uses a larger in-memory transcript buffer for channel analysis, with local hour markers and per-line times.
+- `@codexdeep` searches the current channel's complete ChannelLogger file history and is unavailable in private messages.
+- Deep log contents are untrusted evidence. Codex can list files, perform bounded and paginated literal searches, and read bounded line ranges, but cannot use a general shell or choose another path.
 - The native `codex`, `codexhigh`, and `codexno` names are intentionally free for Aka aliases.
 - Optional persistent memory stores timestamped successful Codex command query/reply pairs per context.
 - Output is sanitized for IRC by stripping markdown, links, control characters, and excess formatting.
@@ -109,6 +124,8 @@ Behavior summary:
 Main Limnoria registry settings:
 
 - `timeoutSeconds`: max end-to-end runtime for one Codex request.
+- `deepTimeoutSeconds`: max runtime for one `@codexdeep` request; default 180 seconds.
+- `deepLogRoot`: optional ChannelLogger root override; empty uses Limnoria's configured log directory.
 - `maxContextLines`: recent IRC context lines retained per channel or PM context.
 - `persistentMemoryEnabled`: enables persisted successful Codex exchange memory.
 - `memoryMaxExchanges`: maximum stored successful Codex exchanges per context.
@@ -125,6 +142,7 @@ Operational defaults in `plugin.py`:
 - `@terrano` and `@lunano` use the matching model's high reasoning and web search settings.
 - `@codexlong` context size: 1000 captured lines.
 - `@codexlong` context time format: hourly local markers plus `[HH:MM]` line prefixes.
+- `@codexdeep` supplies the invoking nick so “I” and “me” can be resolved in historical questions.
 - Captured IRC line cap: 200 chars per line.
 - Reply cap: 1200 chars total.
 - Memory age cap: 72 hours.
@@ -137,7 +155,7 @@ Codex runtime defaults in `scripts/codex_wrapper.py`:
 - Default model: `gpt-5.6-terra`; Luna model: `gpt-5.6-luna`.
 - `model_reasoning_summary = "none"`
 - `model_verbosity = "low"`
-- Hosted web search enabled through `web_search = "live"`.
+- Hosted web search enabled through `web_search = "live"` except in deep mode.
 - Exec sessions are ephemeral and use shared CLI authentication while ignoring
   shared user configuration and rules.
 - Exec local tool families are disabled; the read-only sandbox is retained as
@@ -152,6 +170,7 @@ Mode-specific defaults:
 - `@lunahigh`: `gpt-5.6-luna` with `model_reasoning_effort = "high"`
 - `@lunano`: `gpt-5.6-luna` with `model_reasoning_effort = "high"` without prompt context sections.
 - `@codexlong`: `gpt-5.6-luna` with `model_reasoning_effort = "high"` and transcript-analysis prompt instructions.
+- `@codexdeep`: `gpt-5.6-luna` with `model_reasoning_effort = "high"`, web search disabled, and only the current channel's read-only log tools enabled.
 
 ## Manual Wrapper Test
 
@@ -160,6 +179,9 @@ Default hardened Codex CLI backend using shared `~/.codex` authentication:
 ```bash
 printf '%s\n' 'Say hello in one short sentence.' | plugins/Codex/scripts/codex_wrapper.py --timeout 90
 printf '%s\n' 'Verify the latest Fedora release.' | plugins/Codex/scripts/codex_wrapper.py --timeout 90 --mode terrahigh
+printf '%s\n' 'What did Alice and Bob discuss on election day?' | \
+  plugins/Codex/scripts/codex_wrapper.py --timeout 180 --mode deep \
+  --log-dir /path/to/logs/ChannelLogger/network/channel
 ```
 
 Custom shared Codex home:
@@ -204,6 +226,7 @@ PYTHONPATH=/opt/limnoria /opt/limnoria/bin/python -m unittest plugins.Codex.test
   update the shared `~/.codex/auth.json`, or set
   `CODEX_WRAPPER_EXEC_CODEX_HOME` to the intended shared Codex home.
 - Timeouts: increase `plugins.codex.timeoutSeconds`, shorten prompts, or reduce unnecessary context.
+- Deep-log timeouts: increase `plugins.codex.deepTimeoutSeconds`; confirm `deepLogRoot` contains `network/channel/*.log` files.
 - Busy replies: the plugin allows one active request at a time.
 
 ## License

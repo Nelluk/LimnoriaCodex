@@ -21,11 +21,18 @@ WRAPPER_PATH = Path(__file__).with_name("scripts").joinpath("codex_wrapper.py")
 WRAPPER_SPEC = importlib.util.spec_from_file_location("codex_wrapper_module", WRAPPER_PATH)
 codex_wrapper = importlib.util.module_from_spec(WRAPPER_SPEC)
 WRAPPER_SPEC.loader.exec_module(codex_wrapper)
+DEEP_TOOLS_PATH = WRAPPER_PATH.with_name("deep_log_tools.py")
+DEEP_TOOLS_SPEC = importlib.util.spec_from_file_location(
+    "deep_log_tools_module", DEEP_TOOLS_PATH
+)
+deep_log_tools = importlib.util.module_from_spec(DEEP_TOOLS_SPEC)
+DEEP_TOOLS_SPEC.loader.exec_module(deep_log_tools)
 
 
 class FakeIrc:
-    def __init__(self, nick="CodexBot"):
+    def __init__(self, nick="CodexBot", network="libera"):
         self.nick = nick
+        self.network = network
         self.replies = []
 
     def isChannel(self, target):
@@ -47,6 +54,8 @@ class DummyCodex(Codex):
     def __init__(self):
         self._config = {
             "timeoutSeconds": 90,
+            "deepTimeoutSeconds": 180,
+            "deepLogRoot": "",
             "maxContextLines": 20,
             "persistentMemoryEnabled": False,
             "memoryMaxExchanges": 8,
@@ -94,6 +103,16 @@ class CodexPluginUnitTest(unittest.TestCase):
         self.plugin._memory_path = os.path.join(self.tmpdir, "persistent_memory.json")
         self.irc = FakeIrc()
         self.msg = FakeMsg("alice", "#test", "@codex hi")
+        self.deep_root = os.path.join(self.tmpdir, "ChannelLogger")
+        self.deep_channel = os.path.join(self.deep_root, "libera", "#test")
+        os.makedirs(self.deep_channel)
+        with open(
+            os.path.join(self.deep_channel, "#test.2024-11-05.log"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write("12:00 alice: election question\n12:01 thero: election answer\n")
+        self.plugin._config["deepLogRoot"] = self.deep_root
 
     def tearDown(self):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
@@ -170,6 +189,47 @@ class CodexPluginUnitTest(unittest.TestCase):
             self.irc.replies,
             ["Please provide a prompt. Usage: @codexlong <prompt>"],
         )
+
+    def test_empty_prompt_deep_mode(self):
+        self.plugin._handle_codex_request(self.irc, self.msg, "   ", mode="deep")
+        self.assertEqual(
+            self.irc.replies,
+            ["Please provide a prompt. Usage: @codexdeep <prompt>"],
+        )
+
+    def test_deep_mode_uses_current_channel_logs_and_requester_identity(self):
+        with mock.patch.object(self.plugin, "_invoke_wrapper", return_value="Answer") as wrapped:
+            self.plugin._handle_codex_request(
+                self.irc,
+                self.msg,
+                "What did I argue about?",
+                mode="deep",
+            )
+
+        self.assertEqual(self.irc.replies, ["Answer"])
+        self.assertEqual(wrapped.call_args.args[2], 180)
+        self.assertEqual(wrapped.call_args.kwargs["mode"], "deep")
+        self.assertEqual(wrapped.call_args.kwargs["log_dir"], self.deep_channel)
+        prompt = wrapped.call_args.args[1]
+        self.assertIn("Use the channel_logs tools", prompt)
+        self.assertIn("requester's current IRC nick is alice", prompt)
+        self.assertIn("CURRENT CHANNEL:\n#test", prompt)
+        self.assertNotIn("RECENT CHANNEL LINES", prompt)
+
+    def test_deep_mode_rejects_private_messages(self):
+        private = FakeMsg("alice", "CodexBot", "@codexdeep history")
+        self.plugin._handle_codex_request(
+            self.irc, private, "What happened?", mode="deep"
+        )
+        self.assertEqual(
+            self.irc.replies,
+            ["@codexdeep is available only in a channel"],
+        )
+
+    def test_deep_log_resolution_rejects_path_escape(self):
+        bad_irc = FakeIrc(network="../libera")
+        with self.assertRaisesRegex(WrapperExecutionError, "invalid network"):
+            self.plugin._resolve_deep_log_dir(bad_irc, self.msg)
 
     def test_high_mode_uses_high_prompt_and_shared_timeout(self):
         with mock.patch.object(self.plugin, "_invoke_wrapper", return_value="Answer") as wrapped:
@@ -608,6 +668,33 @@ class CodexPluginUnitTest(unittest.TestCase):
         self.assertEqual(run_mock.call_args.args[1], "prompt text")
         self.assertIn("CODEX_WRAPPER_WRITE_BASE", run_mock.call_args.args[2])
 
+    def test_deep_subprocess_passes_only_prevalidated_log_dir(self):
+        completed = types.SimpleNamespace(returncode=0, stdout="wrapper output\n", stderr="")
+
+        with mock.patch.object(self.plugin, "_run_child_process", return_value=completed) as run_mock:
+            output = self.plugin._invoke_wrapper(
+                "/tmp/wrapper",
+                "prompt text",
+                180,
+                self.plugin._resolve_runtime_write_paths(),
+                mode="deep",
+                log_dir=self.deep_channel,
+            )
+
+        self.assertEqual(output, "wrapper output")
+        self.assertEqual(
+            run_mock.call_args.args[0],
+            [
+                "/tmp/wrapper",
+                "--timeout",
+                "180",
+                "--mode",
+                "deep",
+                "--log-dir",
+                self.deep_channel,
+            ],
+        )
+
     def test_high_mode_wrapper_uses_hardcoded_overrides(self):
         completed = types.SimpleNamespace(returncode=0, stdout="wrapper output\n", stderr="")
 
@@ -668,6 +755,11 @@ class CodexWrapperUnitTest(unittest.TestCase):
         self.assertEqual(luna["reasoning_effort"], "medium")
         self.assertEqual(luna_high["model"], "gpt-5.6-luna")
         self.assertEqual(luna_high["reasoning_effort"], "high")
+        deep = codex_wrapper._runtime_settings(codex_wrapper.MODE_DEEP)
+        self.assertEqual(deep["model"], "gpt-5.6-luna")
+        self.assertEqual(deep["reasoning_effort"], "high")
+        self.assertEqual(deep["web_search"], "disabled")
+        self.assertTrue(deep["deep_logs"])
         self.assertNotIn("minimal", codex_wrapper.ALLOWED_REASONING_EFFORTS)
         self.assertIn("none", codex_wrapper.ALLOWED_REASONING_EFFORTS)
         self.assertIn("max", codex_wrapper.ALLOWED_REASONING_EFFORTS)
@@ -799,6 +891,43 @@ class CodexWrapperUnitTest(unittest.TestCase):
             self.assertIn(f"features.{feature}=false", cmd)
         self.assertEqual(cmd[-1], "-")
 
+    def test_deep_exec_exposes_only_allowlisted_log_mcp_tools(self):
+        settings = codex_wrapper._runtime_settings(codex_wrapper.MODE_DEEP)
+        layout = {"agent_cwd": os.path.join(self.tmpdir, "agent-cwd")}
+        cmd = codex_wrapper._exec_command(
+            "/opt/codex/bin/codex",
+            settings,
+            layout,
+            os.path.join(self.tmpdir, "last-message.txt"),
+        )
+
+        self.assertIn('web_search="disabled"', cmd)
+        self.assertIn("features.shell_tool=false", cmd)
+        self.assertTrue(
+            any(item.startswith("mcp_servers.channel_logs.command=") for item in cmd)
+        )
+        self.assertIn(
+            'mcp_servers.channel_logs.enabled_tools=["list_log_files","search_logs","read_log_lines"]',
+            cmd,
+        )
+        self.assertIn(
+            'mcp_servers.channel_logs.default_tools_approval_mode="approve"', cmd
+        )
+
+    def test_deep_child_env_includes_only_selected_log_dir(self):
+        selected = os.path.join(self.tmpdir, "logs")
+        layout = {
+            "temp": self.tmpdir,
+            "agent_cwd": os.path.join(self.tmpdir, "agent-cwd"),
+        }
+        child_env = codex_wrapper._codex_child_env(
+            "/opt/codex/bin/codex",
+            layout,
+            code_home=self.runtime_home,
+            deep_log_dir=selected,
+        )
+        self.assertEqual(child_env["CODEX_DEEP_LOG_DIR"], selected)
+
     def test_structured_error_detail_extracts_failed_turn_message(self):
         stream = "\n".join(
             [
@@ -810,6 +939,130 @@ class CodexWrapperUnitTest(unittest.TestCase):
             codex_wrapper._structured_error_detail(stream),
             "Usage limit reached. Try again at 12:15 PM.",
         )
+
+
+class DeepLogToolsUnitTest(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="codex-deep-tools-test-")
+        self.filename = "#test.2024-11-05.log"
+        with open(os.path.join(self.tmpdir, self.filename), "w", encoding="utf-8") as handle:
+            handle.write(
+                "12:00 alice: opening\n"
+                "12:01 thero: election claim\n"
+                "12:02 alice: disagreement\n"
+                "12:03 bob: context\n"
+            )
+        self.env_patch = mock.patch.dict(
+            os.environ, {deep_log_tools.LOG_DIR_ENV: self.tmpdir}, clear=False
+        )
+        self.env_patch.start()
+
+    def tearDown(self):
+        self.env_patch.stop()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_lists_searches_and_reads_logs(self):
+        listing = deep_log_tools.list_log_files({"file_pattern": "*2024-11-05.log"})
+        self.assertIn(self.filename, listing)
+
+        matches = deep_log_tools.search_logs(
+            {
+                "query": "THERO",
+                "file_pattern": "*2024-11-05.log",
+                "context_lines": 1,
+            }
+        )
+        self.assertIn("2: 12:01 thero: election claim", matches)
+        self.assertIn("3: 12:02 alice: disagreement", matches)
+
+        excerpt = deep_log_tools.read_log_lines(
+            {"filename": self.filename, "start_line": 2, "line_count": 2}
+        )
+        self.assertIn("2: 12:01 thero: election claim", excerpt)
+        self.assertIn("3: 12:02 alice: disagreement", excerpt)
+
+    def test_search_pagination_reaches_later_matches(self):
+        first_page = deep_log_tools.search_logs(
+            {
+                "query": "alice:",
+                "max_matches": 1,
+                "context_lines": 0,
+            }
+        )
+        self.assertIn("1: 12:00 alice: opening", first_page)
+        self.assertNotIn("3: 12:02 alice: disagreement", first_page)
+        self.assertIn("repeat search_logs with match_offset=1", first_page)
+
+        second_page = deep_log_tools.search_logs(
+            {
+                "query": "alice:",
+                "match_offset": 1,
+                "max_matches": 1,
+                "context_lines": 0,
+            }
+        )
+        self.assertNotIn("1: 12:00 alice: opening", second_page)
+        self.assertIn("3: 12:02 alice: disagreement", second_page)
+        self.assertIn("no more matches are available", second_page)
+
+        exhausted = deep_log_tools.search_logs(
+            {
+                "query": "alice:",
+                "match_offset": 2,
+                "max_matches": 1,
+                "context_lines": 0,
+            }
+        )
+        self.assertEqual(
+            exhausted,
+            "No matching log lines at or after match_offset 2.",
+        )
+
+    def test_search_exact_page_size_does_not_claim_more_matches(self):
+        result = deep_log_tools.search_logs(
+            {
+                "query": "alice:",
+                "max_matches": 2,
+                "context_lines": 0,
+            }
+        )
+        self.assertNotIn("more matches are available", result)
+        self.assertNotIn("match_offset=", result)
+
+    def test_search_safety_truncation_preserves_pagination_cursor(self):
+        with mock.patch.object(deep_log_tools, "MAX_RESPONSE_CHARS", 180):
+            result = deep_log_tools.search_logs(
+                {
+                    "query": ":",
+                    "max_matches": 1,
+                    "context_lines": 1,
+                }
+            )
+        self.assertLessEqual(len(result), 180)
+        self.assertIn("tool output truncated at safety limit", result)
+        self.assertTrue(result.endswith("match_offset=1]"))
+
+    def test_rejects_directory_traversal_and_symlinks(self):
+        with self.assertRaises(deep_log_tools.ToolError):
+            deep_log_tools.read_log_lines(
+                {"filename": "../secret.log", "start_line": 1}
+            )
+
+        outside = os.path.join(os.path.dirname(self.tmpdir), "outside.log")
+        with open(outside, "w", encoding="utf-8") as handle:
+            handle.write("secret\n")
+        link = os.path.join(self.tmpdir, "linked.log")
+        try:
+            os.symlink(outside, link)
+            with self.assertRaises(deep_log_tools.ToolError):
+                deep_log_tools.read_log_lines(
+                    {"filename": "linked.log", "start_line": 1}
+                )
+        finally:
+            try:
+                os.unlink(outside)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
