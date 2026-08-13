@@ -965,6 +965,13 @@ class CodexWrapperUnitTest(unittest.TestCase):
             child_env["CODEX_DEEP_LOG_CUTOFF"], "2024-11-05T12:34:56"
         )
 
+    def test_deep_cutoff_defaults_for_pre_reload_plugin_compatibility(self):
+        with mock.patch.object(
+            codex_wrapper.time, "strftime", return_value="2024-11-05T12:34:56"
+        ):
+            cutoff = codex_wrapper._resolve_deep_log_cutoff(None)
+        self.assertEqual(cutoff, "2024-11-05T12:34:56")
+
     def test_structured_error_detail_extracts_failed_turn_message(self):
         stream = "\n".join(
             [

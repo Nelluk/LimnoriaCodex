@@ -552,7 +552,7 @@ def _resolve_deep_log_dir(configured):
 
 def _resolve_deep_log_cutoff(configured):
     if not configured:
-        raise RuntimeError("deep mode requires --log-cutoff")
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
     try:
         datetime.strptime(configured, "%Y-%m-%dT%H:%M:%S")
     except (TypeError, ValueError) as exc:
@@ -599,7 +599,7 @@ def main():
     parser.add_argument(
         "--log-cutoff",
         default=None,
-        help="Local timestamp immediately before the request; required only in deep mode.",
+        help="Optional local timestamp immediately before the request; defaults to now in deep mode.",
     )
     args = parser.parse_args()
 
