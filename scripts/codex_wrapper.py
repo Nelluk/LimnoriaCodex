@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import types
+from datetime import datetime
 
 
 DEFAULT_TIMEOUT_SECONDS = 90
@@ -231,7 +232,9 @@ def _resolve_exec_codex_home():
     return code_home
 
 
-def _codex_child_env(codex_binary, layout, code_home, deep_log_dir=None):
+def _codex_child_env(
+    codex_binary, layout, code_home, deep_log_dir=None, deep_log_cutoff=None
+):
     inherited_keys = (
         "HOME",
         "USER",
@@ -260,6 +263,8 @@ def _codex_child_env(codex_binary, layout, code_home, deep_log_dir=None):
     run_env["PWD"] = layout["agent_cwd"]
     if deep_log_dir:
         run_env["CODEX_DEEP_LOG_DIR"] = deep_log_dir
+    if deep_log_cutoff:
+        run_env["CODEX_DEEP_LOG_CUTOFF"] = deep_log_cutoff
     return run_env
 
 
@@ -314,7 +319,7 @@ def _exec_command(codex_binary, settings, layout, output_path):
                 "-c",
                 f"mcp_servers.channel_logs.args=[{_toml_string(DEEP_TOOLS_PATH)}]",
                 "-c",
-                'mcp_servers.channel_logs.env_vars=["CODEX_DEEP_LOG_DIR"]',
+                'mcp_servers.channel_logs.env_vars=["CODEX_DEEP_LOG_DIR","CODEX_DEEP_LOG_CUTOFF"]',
                 "-c",
                 "mcp_servers.channel_logs.required=true",
                 "-c",
@@ -348,11 +353,6 @@ def _has_non_fatal_rollout_error(text):
     return NON_FATAL_ROLLOUT_ERROR in (text or "")
 
 
-def _last_nonempty_lines(text, limit=6):
-    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
-    return lines[-limit:]
-
-
 def _structured_error_detail(text):
     """Extract useful failure text from codex exec's JSONL event stream."""
     messages = []
@@ -383,15 +383,6 @@ def _structured_error_detail(text):
                     messages.append(candidate)
 
     return " | ".join(messages)[-2000:]
-
-
-def _timeout_detail(exc):
-    detail_lines = _last_nonempty_lines(getattr(exc, "stderr", "") or "")
-    if not detail_lines:
-        detail_lines = _last_nonempty_lines(getattr(exc, "stdout", "") or "")
-    if not detail_lines:
-        return ""
-    return " | last output: " + " | ".join(detail_lines)
 
 
 def _debug_env_summary(env):
@@ -559,6 +550,16 @@ def _resolve_deep_log_dir(configured):
     return resolved
 
 
+def _resolve_deep_log_cutoff(configured):
+    if not configured:
+        raise RuntimeError("deep mode requires --log-cutoff")
+    try:
+        datetime.strptime(configured, "%Y-%m-%dT%H:%M:%S")
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("deep log cutoff is invalid") from exc
+    return configured
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Run one Codex request with fixed production settings.",
@@ -595,6 +596,11 @@ def main():
         default=None,
         help="Prevalidated current-channel log directory; required only in deep mode.",
     )
+    parser.add_argument(
+        "--log-cutoff",
+        default=None,
+        help="Local timestamp immediately before the request; required only in deep mode.",
+    )
     args = parser.parse_args()
 
     timeout_seconds = _resolve_timeout(args.timeout)
@@ -606,14 +612,16 @@ def main():
     if args.mode == MODE_DEEP:
         try:
             deep_log_dir = _resolve_deep_log_dir(args.log_dir)
+            deep_log_cutoff = _resolve_deep_log_cutoff(args.log_cutoff)
         except RuntimeError as exc:
             print(str(exc)[:300], file=sys.stderr)
             return 125
     else:
-        if args.log_dir:
-            print("--log-dir is valid only in deep mode", file=sys.stderr)
+        if args.log_dir or args.log_cutoff:
+            print("--log-dir and --log-cutoff are valid only in deep mode", file=sys.stderr)
             return 2
         deep_log_dir = None
+        deep_log_cutoff = None
     prompt_text = sys.stdin.read()
     if not prompt_text.strip():
         print("empty prompt", file=sys.stderr)
@@ -649,6 +657,7 @@ def main():
                 layout,
                 code_home=exec_code_home,
                 deep_log_dir=deep_log_dir,
+                deep_log_cutoff=deep_log_cutoff,
             )
             _append_debug_line(
                 layout,
@@ -671,12 +680,9 @@ def main():
                 cwd=layout["agent_cwd"],
                 temp_dir=layout["temp"],
             )
-        except subprocess.TimeoutExpired as exc:
-            _append_debug_line(layout, f"timeout seconds={timeout_seconds}{_timeout_detail(exc)}")
-            print(
-                f"codex timed out after {timeout_seconds}s{_timeout_detail(exc)}",
-                file=sys.stderr,
-            )
+        except subprocess.TimeoutExpired:
+            _append_debug_line(layout, f"timeout seconds={timeout_seconds}")
+            print(f"codex timed out after {timeout_seconds}s", file=sys.stderr)
             return 124
         except FileNotFoundError:
             print("codex binary not found", file=sys.stderr)
@@ -689,9 +695,13 @@ def main():
             raw_detail = (proc.stderr or proc.stdout or "").strip()
             structured_detail = _structured_error_detail(proc.stdout)
             detail = structured_detail or raw_detail
+            debug_detail = structured_detail or (
+                f"unstructured stderr_chars={len(proc.stderr or '')} "
+                f"stdout_chars={len(proc.stdout or '')}"
+            )
             _append_debug_line(
                 layout,
-                f"exit returncode={proc.returncode} detail_tail={_timeout_detail(proc)}",
+                f"exit returncode={proc.returncode} detail={debug_detail[-300:]}",
             )
             try:
                 last_message = _read_last_message(output_path)

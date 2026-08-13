@@ -112,8 +112,9 @@ Behavior summary:
 - `@terra`/`@terrahigh` and `@luna`/`@lunahigh` expose medium- and high-reasoning model primitives.
 - `@terrano` and `@lunano` use their model's higher-effort preset without including channel context or prior Codex memory in the prompt.
 - `@codexlong` uses a larger in-memory transcript buffer for channel analysis, with local hour markers and per-line times.
-- `@codexdeep` searches the current channel's complete ChannelLogger file history and is unavailable in private messages.
-- Deep log contents are untrusted evidence. Codex can list files, perform bounded and paginated literal searches, and read bounded line ranges, but cannot use a general shell or choose another path.
+- `@codexdeep` searches the current channel's complete ChannelLogger file history and is unavailable in private messages. Each request sees a timestamped snapshot ending before its own command, preventing the prompt or later chat from becoming evidence.
+- Deep log contents are untrusted evidence. Codex can list files, perform bounded and paginated searches by literal text and/or exact speaker, choose oldest/newest ordering and asymmetric event context, and read bounded line ranges, but cannot use a general shell or choose another path.
+- Deep requests have a 20-call log-tool budget. The prompt directs Codex to plan first, batch quantitative searches, and avoid searching at all for quick tests or nonhistorical requests.
 - The native `codex`, `codexhigh`, and `codexno` names are intentionally free for Aka aliases.
 - Optional persistent memory stores timestamped successful Codex command query/reply pairs per context.
 - Output is sanitized for IRC by stripping markdown, links, control characters, and excess formatting.
@@ -181,7 +182,8 @@ printf '%s\n' 'Say hello in one short sentence.' | plugins/Codex/scripts/codex_w
 printf '%s\n' 'Verify the latest Fedora release.' | plugins/Codex/scripts/codex_wrapper.py --timeout 90 --mode terrahigh
 printf '%s\n' 'What did Alice and Bob discuss on election day?' | \
   plugins/Codex/scripts/codex_wrapper.py --timeout 180 --mode deep \
-  --log-dir /path/to/logs/ChannelLogger/network/channel
+  --log-dir /path/to/logs/ChannelLogger/network/channel \
+  --log-cutoff "$(date +%Y-%m-%dT%H:%M:%S)"
 ```
 
 Custom shared Codex home:

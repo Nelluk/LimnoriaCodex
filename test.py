@@ -210,8 +210,14 @@ class CodexPluginUnitTest(unittest.TestCase):
         self.assertEqual(wrapped.call_args.args[2], 180)
         self.assertEqual(wrapped.call_args.kwargs["mode"], "deep")
         self.assertEqual(wrapped.call_args.kwargs["log_dir"], self.deep_channel)
+        self.assertRegex(
+            wrapped.call_args.kwargs["log_cutoff"],
+            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$",
+        )
         prompt = wrapped.call_args.args[1]
-        self.assertIn("Use the channel_logs tools", prompt)
+        self.assertIn("use the channel_logs tools", prompt)
+        self.assertIn("at most 20 channel-log tool calls", prompt)
+        self.assertIn("quantitative questions", prompt)
         self.assertIn("requester's current IRC nick is alice", prompt)
         self.assertIn("CURRENT CHANNEL:\n#test", prompt)
         self.assertNotIn("RECENT CHANNEL LINES", prompt)
@@ -679,6 +685,7 @@ class CodexPluginUnitTest(unittest.TestCase):
                 self.plugin._resolve_runtime_write_paths(),
                 mode="deep",
                 log_dir=self.deep_channel,
+                log_cutoff="2024-11-05T12:34:56",
             )
 
         self.assertEqual(output, "wrapper output")
@@ -692,8 +699,30 @@ class CodexPluginUnitTest(unittest.TestCase):
                 "deep",
                 "--log-dir",
                 self.deep_channel,
+                "--log-cutoff",
+                "2024-11-05T12:34:56",
             ],
         )
+
+    def test_wrapper_exit_124_is_timeout_even_if_stderr_mentions_quota(self):
+        completed = types.SimpleNamespace(
+            returncode=124,
+            stdout="",
+            stderr="old retrieved log line said usage limit",
+        )
+        with mock.patch.object(
+            self.plugin, "_run_child_process", return_value=completed
+        ):
+            with self.assertRaises(WrapperTimeoutError):
+                self.plugin._invoke_wrapper(
+                    "/tmp/wrapper",
+                    "prompt text",
+                    180,
+                    self.plugin._resolve_runtime_write_paths(),
+                    mode="deep",
+                    log_dir=self.deep_channel,
+                    log_cutoff="2024-11-05T12:34:56",
+                )
 
     def test_high_mode_wrapper_uses_hardcoded_overrides(self):
         completed = types.SimpleNamespace(returncode=0, stdout="wrapper output\n", stderr="")
@@ -913,6 +942,10 @@ class CodexWrapperUnitTest(unittest.TestCase):
         self.assertIn(
             'mcp_servers.channel_logs.default_tools_approval_mode="approve"', cmd
         )
+        self.assertIn(
+            'mcp_servers.channel_logs.env_vars=["CODEX_DEEP_LOG_DIR","CODEX_DEEP_LOG_CUTOFF"]',
+            cmd,
+        )
 
     def test_deep_child_env_includes_only_selected_log_dir(self):
         selected = os.path.join(self.tmpdir, "logs")
@@ -925,8 +958,12 @@ class CodexWrapperUnitTest(unittest.TestCase):
             layout,
             code_home=self.runtime_home,
             deep_log_dir=selected,
+            deep_log_cutoff="2024-11-05T12:34:56",
         )
         self.assertEqual(child_env["CODEX_DEEP_LOG_DIR"], selected)
+        self.assertEqual(
+            child_env["CODEX_DEEP_LOG_CUTOFF"], "2024-11-05T12:34:56"
+        )
 
     def test_structured_error_detail_extracts_failed_turn_message(self):
         stream = "\n".join(
@@ -956,6 +993,7 @@ class DeepLogToolsUnitTest(unittest.TestCase):
             os.environ, {deep_log_tools.LOG_DIR_ENV: self.tmpdir}, clear=False
         )
         self.env_patch.start()
+        deep_log_tools._tool_call_count = 0
 
     def tearDown(self):
         self.env_patch.stop()
@@ -1029,6 +1067,57 @@ class DeepLogToolsUnitTest(unittest.TestCase):
         self.assertNotIn("more matches are available", result)
         self.assertNotIn("match_offset=", result)
 
+    def test_search_filters_speaker_orders_newest_and_uses_asymmetric_context(self):
+        result = deep_log_tools.search_logs(
+            {
+                "speaker": "ALICE",
+                "sort_order": "newest_first",
+                "max_matches": 1,
+                "before_lines": 0,
+                "after_lines": 1,
+            }
+        )
+        self.assertIn("EVENT 1", result)
+        self.assertIn(">3: 12:02 alice: disagreement", result)
+        self.assertIn(" 4: 12:03 bob: context", result)
+        self.assertNotIn("1: 12:00 alice: opening", result)
+
+    def test_cutoff_excludes_triggering_minute_from_search_and_read(self):
+        with mock.patch.dict(
+            os.environ,
+            {deep_log_tools.LOG_CUTOFF_ENV: "2024-11-05T12:02:30"},
+            clear=False,
+        ):
+            result = deep_log_tools.search_logs(
+                {"query": "alice:", "context_lines": 0}
+            )
+            excerpt = deep_log_tools.read_log_lines(
+                {"filename": self.filename, "start_line": 1, "line_count": 4}
+            )
+        self.assertIn("12:00 alice: opening", result)
+        self.assertNotIn("12:02 alice: disagreement", result)
+        self.assertIn("12:01 thero: election claim", excerpt)
+        self.assertNotIn("12:02 alice: disagreement", excerpt)
+
+    def test_tool_call_budget_stops_runaway_search(self):
+        request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "search_logs", "arguments": {"query": "alice"}},
+        }
+        with mock.patch.object(deep_log_tools, "MAX_TOOL_CALLS", 2), mock.patch.object(
+            deep_log_tools, "TOOL_BUDGET_WARNING_CALL", 1
+        ):
+            first = deep_log_tools._handle_request(request)
+            second = deep_log_tools._handle_request(request)
+            third = deep_log_tools._handle_request(request)
+        self.assertFalse(first["result"]["isError"])
+        self.assertIn("1 tool calls remain", first["result"]["content"][1]["text"])
+        self.assertFalse(second["result"]["isError"])
+        self.assertTrue(third["result"]["isError"])
+        self.assertIn("budget exhausted", third["result"]["content"][0]["text"])
+
     def test_search_safety_truncation_preserves_pagination_cursor(self):
         with mock.patch.object(deep_log_tools, "MAX_RESPONSE_CHARS", 180):
             result = deep_log_tools.search_logs(
@@ -1041,6 +1130,18 @@ class DeepLogToolsUnitTest(unittest.TestCase):
         self.assertLessEqual(len(result), 180)
         self.assertIn("tool output truncated at safety limit", result)
         self.assertTrue(result.endswith("match_offset=1]"))
+
+    def test_output_limit_cursor_does_not_skip_unreturned_events(self):
+        with mock.patch.object(deep_log_tools, "MAX_RESPONSE_CHARS", 120):
+            result = deep_log_tools.search_logs(
+                {
+                    "query": "alice:",
+                    "max_matches": 2,
+                    "context_lines": 0,
+                }
+            )
+        self.assertIn("match_offset=1", result)
+        self.assertNotIn("match_offset=2", result)
 
     def test_rejects_directory_traversal_and_symlinks(self):
         with self.assertRaises(deep_log_tools.ToolError):
