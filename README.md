@@ -45,13 +45,10 @@ Optional channel allowlist:
 @config plugins.codex.allowedChannels "#example #bots"
 ```
 
-`@codexdeep` derives its archive from the current network and channel beneath
-Limnoria's `logs/ChannelLogger` directory. Override only the ChannelLogger root
-when the deployment stores it elsewhere:
-
-```irc
-@config plugins.codex.deepLogRoot /path/to/logs/ChannelLogger
-```
+`@codexdeep` uses a deployment-owned restricted transport configured at
+`data/Codex/soju-history/transport.json`. The production policy exposes only
+the canonical Freenode `#debate2016` and Libera `##debate2016` lineage, and the
+command is therefore available only from Libera `##debate2016`.
 
 ## Authentication
 
@@ -64,8 +61,8 @@ Exec requests ignore shared user configuration and rules, run without persisted
 session files, and use an empty plugin-owned working directory. Local shell,
 apps, plugins, hooks, browser/computer use, memories, and multi-agent features
 are disabled. Hosted web search remains available for ordinary modes. Deep
-mode disables web search and exposes only three read-only, path-confined log
-tools through a plugin-owned local MCP server.
+mode disables web search and exposes only seven read-only canonical-history
+tools through a plugin-owned local MCP server and restricted SSH transport.
 
 The current deployment is validated with `codex-cli 0.147.0`.
 
@@ -83,7 +80,7 @@ ReadWritePaths=/home/nelluk/.codex
 Then run `systemctl daemon-reload` and restart the bot service. Other home paths
 remain read-only. The Codex child still ignores shared user configuration and
 rules and exposes no general local shell or filesystem tool to IRC prompts.
-Deep mode adds only its path-confined, read-only channel-log tools.
+Deep mode adds only its fixed-scope, read-only canonical-history tools.
 
 ## Commands
 
@@ -112,9 +109,10 @@ Behavior summary:
 - `@terra`/`@terrahigh` and `@luna`/`@lunahigh` expose medium- and high-reasoning model primitives.
 - `@terrano` and `@lunano` use their model's higher-effort preset without including channel context or prior Codex memory in the prompt.
 - `@codexlong` uses a larger in-memory transcript buffer for channel analysis, with local hour markers and per-line times.
-- `@codexdeep` searches the current channel's complete ChannelLogger file history and is unavailable in private messages. Each request sees a timestamped snapshot ending before its own command, preventing the prompt or later chat from becoming evidence.
-- Deep log contents are untrusted evidence. Codex can list files, perform bounded and paginated searches by literal text and/or exact speaker, choose oldest/newest ordering and asymmetric event context, and read bounded line ranges, but cannot use a general shell or choose another path.
-- Deep requests have a 20-call log-tool budget. The prompt directs Codex to plan first, batch quantitative searches, and avoid searching at all for quick tests or nonhistorical requests.
+- `@codexdeep` searches canonical Soju history for the debate2016 channel lineage and is unavailable in private messages or other channels.
+- Returned history is untrusted evidence. The model receives only `search`, `search_summary`, `history_summary`, `context`, `conversations`, `speaker_history`, and `aggregate`; it cannot choose another network, target, scope, remote command, or local path.
+- `history_summary` provides exact entire-scope totals and boundary messages; `search_summary` provides exact topical totals and chronological edges; `context` expands a message ID; `search` finds individual evidence; `conversations` reconstructs participant-aware exchanges; `speaker_history` samples a speaker timeline; and `aggregate` groups exact counts by sender/day/week/month/year.
+- Deep requests have a 20-call history-tool budget. The prompt directs Codex to plan first, use the operation matching the question, inspect completeness/truncation metadata, combine only explicit aliases, and avoid searching for nonhistorical requests.
 - The native `codex`, `codexhigh`, and `codexno` names are intentionally free for Aka aliases.
 - Optional persistent memory stores timestamped successful Codex command query/reply pairs per context.
 - Output is sanitized for IRC by stripping markdown, links, control characters, and excess formatting.
@@ -126,7 +124,6 @@ Main Limnoria registry settings:
 
 - `timeoutSeconds`: max end-to-end runtime for one Codex request.
 - `deepTimeoutSeconds`: max runtime for one `@codexdeep` request; default 180 seconds.
-- `deepLogRoot`: optional ChannelLogger root override; empty uses Limnoria's configured log directory.
 - `maxContextLines`: recent IRC context lines retained per channel or PM context.
 - `persistentMemoryEnabled`: enables persisted successful Codex exchange memory.
 - `memoryMaxExchanges`: maximum stored successful Codex exchanges per context.
@@ -135,7 +132,7 @@ Main Limnoria registry settings:
 
 Operational defaults in `plugin.py`:
 
-- Wrapper script: `scripts/codex_wrapper.py`
+- Canonical wrapper script: `scripts/codex_wrapper.py`
 - Wrapper runtime base: Limnoria data directory for this plugin.
 - `@terrahigh` and `@lunahigh` reasoning effort: `high`
 - `@terrahigh` and `@lunahigh` web search context size: `high`
@@ -171,7 +168,7 @@ Mode-specific defaults:
 - `@lunahigh`: `gpt-5.6-luna` with `model_reasoning_effort = "high"`
 - `@lunano`: `gpt-5.6-luna` with `model_reasoning_effort = "high"` without prompt context sections.
 - `@codexlong`: `gpt-5.6-luna` with `model_reasoning_effort = "high"` and transcript-analysis prompt instructions.
-- `@codexdeep`: `gpt-5.6-luna` with `model_reasoning_effort = "high"`, web search disabled, and only the current channel's read-only log tools enabled.
+- `@codexdeep`: `gpt-5.6-luna` with `model_reasoning_effort = "high"`, web search disabled, and only the seven canonical Soju history tools enabled.
 
 ## Manual Wrapper Test
 
@@ -182,8 +179,8 @@ printf '%s\n' 'Say hello in one short sentence.' | plugins/Codex/scripts/codex_w
 printf '%s\n' 'Verify the latest Fedora release.' | plugins/Codex/scripts/codex_wrapper.py --timeout 90 --mode terrahigh
 printf '%s\n' 'What did Alice and Bob discuss on election day?' | \
   plugins/Codex/scripts/codex_wrapper.py --timeout 180 --mode deep \
-  --log-dir /path/to/logs/ChannelLogger/network/channel \
-  --log-cutoff "$(date +%Y-%m-%dT%H:%M:%S)"
+  --soju-transport-config /path/to/private/transport.json \
+  --soju-cutoff '<exclusive-UTC-cutoff>'
 ```
 
 Custom shared Codex home:
@@ -204,6 +201,37 @@ CODEX_WRAPPER_TEMP_DIR=/path/to/runtime/tmp \
 plugins/Codex/scripts/codex_wrapper.py --timeout 90
 ```
 
+## Private Usage Telemetry
+
+Every wrapper invocation appends one private JSONL record to
+`OUTPUT_DIR/usage-telemetry.jsonl` (normally
+`data/Codex/output/usage-telemetry.jsonl`). The file is forced to mode `0600`
+and does not contain prompts, replies, channel logs, credentials, or local
+paths.
+The active log rotates at 5 MB, retaining one `usage-telemetry.jsonl.1`
+backup, so telemetry is bounded to roughly 10 MB.
+
+Each record includes the mode, model, reasoning effort, result status, elapsed
+time, and the exact input, cached-input, output, and reasoning-output counters
+reported by `codex exec --json`. After the model process exits, the wrapper also
+uses the documented app-server `account/rateLimits/read` method to record all
+currently returned quota buckets, their integer used percentages, window
+durations, and reset times. Bucket IDs and window types are dynamic; consumers
+must not assume that every account has fixed five-hour and weekly buckets.
+
+Quota collection has a five-second deadline and is fail-open. If app-server or
+the account lookup is unavailable, the record says the quota snapshot is
+unavailable while the original Codex result and IRC response remain unchanged.
+Because quota percentages are integer snapshots and other Codex clients may use
+the same account, differences between records are observational rather than an
+exact per-request quota charge.
+
+Deep-mode MCP calls append separate metadata-only records to
+`OUTPUT_DIR/soju-tool-telemetry.jsonl`. Each record includes its UTC start time,
+parent Codex request ID, sequential call index, tool/status, duration, response
+size, and available count/completeness fields. Queries and returned message
+bodies are never logged.
+
 ## Tests
 
 Run tests from a writable directory so Limnoria can create its relative logs path:
@@ -222,13 +250,19 @@ PYTHONPATH=/opt/limnoria /opt/limnoria/bin/python -m unittest plugins.Codex.test
 
 ## Troubleshooting
 
+On the deployed production service, `@reload Codex` has proved unreliable. After
+an approved production deployment, perform one full `ircbot.service` restart
+and verify the new process and plugin behavior instead of relying on an in-bot
+plugin reload.
+
 - `Codex runtime path error`: verify the Limnoria process can write to its data directory.
 - `codex binary not found`: install Codex CLI and ensure `codex` is on the bot process PATH.
 - Authentication failures: verify the bot account can read and
   update the shared `~/.codex/auth.json`, or set
   `CODEX_WRAPPER_EXEC_CODEX_HOME` to the intended shared Codex home.
 - Timeouts: increase `plugins.codex.timeoutSeconds`, shorten prompts, or reduce unnecessary context.
-- Deep-log timeouts: increase `plugins.codex.deepTimeoutSeconds`; confirm `deepLogRoot` contains `network/channel/*.log` files.
+- Canonical-history failures: confirm the private transport configuration, identity, and pinned host data are readable by the bot account and that the restricted endpoint is reachable.
+- Missing quota snapshots: inspect `usage-telemetry.jsonl`; quota collection is optional and never fails the IRC request.
 - Busy replies: the plugin allows one active request at a time.
 
 ## License

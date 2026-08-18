@@ -1,8 +1,11 @@
 """Unit tests for Codex plugin."""
 
 import importlib.util
+import io
+import json
 import os
 import shutil
+import stat
 import threading
 import tempfile
 import time
@@ -21,12 +24,18 @@ WRAPPER_PATH = Path(__file__).with_name("scripts").joinpath("codex_wrapper.py")
 WRAPPER_SPEC = importlib.util.spec_from_file_location("codex_wrapper_module", WRAPPER_PATH)
 codex_wrapper = importlib.util.module_from_spec(WRAPPER_SPEC)
 WRAPPER_SPEC.loader.exec_module(codex_wrapper)
-DEEP_TOOLS_PATH = WRAPPER_PATH.with_name("deep_log_tools.py")
-DEEP_TOOLS_SPEC = importlib.util.spec_from_file_location(
-    "deep_log_tools_module", DEEP_TOOLS_PATH
+SOJU_TOOLS_PATH = WRAPPER_PATH.with_name("soju_history_tools.py")
+SOJU_TOOLS_SPEC = importlib.util.spec_from_file_location(
+    "soju_history_tools_module", SOJU_TOOLS_PATH
 )
-deep_log_tools = importlib.util.module_from_spec(DEEP_TOOLS_SPEC)
-DEEP_TOOLS_SPEC.loader.exec_module(deep_log_tools)
+soju_history_tools = importlib.util.module_from_spec(SOJU_TOOLS_SPEC)
+SOJU_TOOLS_SPEC.loader.exec_module(soju_history_tools)
+SOJU_CLIENT_PATH = WRAPPER_PATH.with_name("irclogs_bot_client.py")
+SOJU_CLIENT_SPEC = importlib.util.spec_from_file_location(
+    "irclogs_bot_client_module", SOJU_CLIENT_PATH
+)
+irclogs_bot_client = importlib.util.module_from_spec(SOJU_CLIENT_SPEC)
+SOJU_CLIENT_SPEC.loader.exec_module(irclogs_bot_client)
 
 
 class FakeIrc:
@@ -43,11 +52,21 @@ class FakeIrc:
 
 
 class FakeMsg:
-    def __init__(self, nick, channel, text, prefix=None):
+    def __init__(
+        self,
+        nick,
+        channel,
+        text,
+        prefix=None,
+        timestamp=1787002228.0,
+        server_time="2026-08-17T21:30:28.000Z",
+    ):
         self.nick = nick
         self.prefix = prefix or f"{nick}!user@example.com"
         self.args = [channel, text]
         self.channel = channel
+        self.time = timestamp
+        self.server_tags = {} if server_time is None else {"time": server_time}
 
 
 class DummyCodex(Codex):
@@ -55,7 +74,6 @@ class DummyCodex(Codex):
         self._config = {
             "timeoutSeconds": 90,
             "deepTimeoutSeconds": 180,
-            "deepLogRoot": "",
             "maxContextLines": 20,
             "persistentMemoryEnabled": False,
             "memoryMaxExchanges": 8,
@@ -71,6 +89,7 @@ class DummyCodex(Codex):
         self._last_request_by_user = {}
         self._memory_state = None
         self._memory_path = "/tmp/codex-test-base/persistent_memory.json"
+        self._transport_config_path = "/tmp/codex-test-base/soju-history/transport.json"
         self.WRAPPER_PATH = "/bin/echo"
         self.WRAPPER_WRITABLE_BASE = "/tmp/codex-test-base"
         self.log = types.SimpleNamespace(
@@ -95,6 +114,12 @@ class DummyCodex(Codex):
     def _memory_storage_path(self):
         return self._memory_path
 
+    def _soju_transport_config_path(self):
+        return (
+            os.path.dirname(os.path.dirname(self._transport_config_path)),
+            self._transport_config_path,
+        )
+
 
 class CodexPluginUnitTest(unittest.TestCase):
     def setUp(self):
@@ -103,16 +128,12 @@ class CodexPluginUnitTest(unittest.TestCase):
         self.plugin._memory_path = os.path.join(self.tmpdir, "persistent_memory.json")
         self.irc = FakeIrc()
         self.msg = FakeMsg("alice", "#test", "@codex hi")
-        self.deep_root = os.path.join(self.tmpdir, "ChannelLogger")
-        self.deep_channel = os.path.join(self.deep_root, "libera", "#test")
-        os.makedirs(self.deep_channel)
-        with open(
-            os.path.join(self.deep_channel, "#test.2024-11-05.log"),
-            "w",
-            encoding="utf-8",
-        ) as handle:
-            handle.write("12:00 alice: election question\n12:01 thero: election answer\n")
-        self.plugin._config["deepLogRoot"] = self.deep_root
+        self.deep_msg = FakeMsg("alice", "##debate2016", "@codexdeep history")
+        transport_dir = os.path.join(self.tmpdir, "Codex", "soju-history")
+        os.makedirs(transport_dir)
+        self.plugin._transport_config_path = os.path.join(transport_dir, "transport.json")
+        with open(self.plugin._transport_config_path, "w", encoding="utf-8") as handle:
+            handle.write("{}")
 
     def tearDown(self):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
@@ -122,6 +143,15 @@ class CodexPluginUnitTest(unittest.TestCase):
             self.assertTrue(callable(getattr(self.plugin, name)))
         for name in ("codex", "codexhigh", "codexno"):
             self.assertFalse(hasattr(Codex, name))
+
+    def test_canonical_wrapper_and_mcp_paths_are_selected(self):
+        self.assertTrue(Codex.WRAPPER_PATH.endswith("/scripts/codex_wrapper.py"))
+        self.assertEqual(
+            os.path.basename(codex_wrapper.SOJU_TOOLS_PATH),
+            "soju_history_tools.py",
+        )
+        self.assertFalse(Codex.WRAPPER_PATH.endswith("_expanded.py"))
+        self.assertFalse(codex_wrapper.SOJU_TOOLS_PATH.endswith("_expanded.py"))
 
     def test_success_path(self):
         with mock.patch.object(self.plugin, "_invoke_wrapper", return_value="Answer") as wrapped:
@@ -197,11 +227,11 @@ class CodexPluginUnitTest(unittest.TestCase):
             ["Please provide a prompt. Usage: @codexdeep <prompt>"],
         )
 
-    def test_deep_mode_uses_current_channel_logs_and_requester_identity(self):
+    def test_deep_mode_uses_canonical_history_and_requester_identity(self):
         with mock.patch.object(self.plugin, "_invoke_wrapper", return_value="Answer") as wrapped:
             self.plugin._handle_codex_request(
                 self.irc,
-                self.msg,
+                self.deep_msg,
                 "What did I argue about?",
                 mode="deep",
             )
@@ -209,17 +239,35 @@ class CodexPluginUnitTest(unittest.TestCase):
         self.assertEqual(self.irc.replies, ["Answer"])
         self.assertEqual(wrapped.call_args.args[2], 180)
         self.assertEqual(wrapped.call_args.kwargs["mode"], "deep")
-        self.assertEqual(wrapped.call_args.kwargs["log_dir"], self.deep_channel)
-        self.assertRegex(
-            wrapped.call_args.kwargs["log_cutoff"],
-            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$",
+        self.assertEqual(
+            wrapped.call_args.kwargs["soju_transport_config"],
+            self.plugin._transport_config_path,
+        )
+        self.assertEqual(
+            wrapped.call_args.kwargs["soju_cutoff"],
+            "2026-08-17T21:30:28.000Z",
         )
         prompt = wrapped.call_args.args[1]
-        self.assertIn("use the channel_logs tools", prompt)
-        self.assertIn("at most 20 channel-log tool calls", prompt)
-        self.assertIn("quantitative questions", prompt)
+        self.assertIn("use the soju_history tools", prompt)
+        self.assertIn("at most 20 history tool calls", prompt)
+        self.assertIn("call aggregate once with summary_only=true", prompt)
+        self.assertIn("Use search_summary for exact ungrouped", prompt)
+        self.assertIn("call history_summary exactly once and stop", prompt)
+        self.assertIn("answer from history_summary first_time and last_time", prompt)
+        self.assertIn("legitimately have null text", prompt)
+        self.assertIn("only a compatibility fallback", prompt)
+        self.assertIn("Never issue generic or common-word full-text searches", prompt)
+        self.assertIn("use context for bounded chronological expansion", prompt)
+        self.assertIn("pass explicit from_time and until_time", prompt)
+        self.assertIn("Never infer that a sender is a bot", prompt)
+        self.assertIn("matching_messages counts messages", prompt)
+        self.assertIn("groups_total counts distinct groups", prompt)
+        self.assertIn("effective_to_time", prompt)
+        self.assertIn("Use speaker_history", prompt)
+        self.assertIn("Use conversations", prompt)
+        self.assertIn("current, former, planned, denied, and uncertain", prompt)
         self.assertIn("requester's current IRC nick is alice", prompt)
-        self.assertIn("CURRENT CHANNEL:\n#test", prompt)
+        self.assertIn("CURRENT CHANNEL:\n##debate2016", prompt)
         self.assertNotIn("RECENT CHANNEL LINES", prompt)
 
     def test_deep_mode_rejects_private_messages(self):
@@ -232,10 +280,115 @@ class CodexPluginUnitTest(unittest.TestCase):
             ["@codexdeep is available only in a channel"],
         )
 
-    def test_deep_log_resolution_rejects_path_escape(self):
-        bad_irc = FakeIrc(network="../libera")
-        with self.assertRaisesRegex(WrapperExecutionError, "invalid network"):
-            self.plugin._resolve_deep_log_dir(bad_irc, self.msg)
+    def test_deep_mode_fails_closed_without_valid_message_time(self):
+        for timestamp in (None, "not-a-time"):
+            self.irc.replies.clear()
+            msg = FakeMsg(
+                "alice",
+                "##debate2016",
+                "@codexdeep history",
+                timestamp=timestamp,
+                server_time=None,
+            )
+            with mock.patch.object(self.plugin, "_invoke_wrapper") as wrapped:
+                self.plugin._handle_codex_request(
+                    self.irc, msg, "What happened?", mode="deep"
+                )
+            self.assertTrue(self.irc.replies)
+            self.assertIn("cutoff", self.irc.replies[0])
+            wrapped.assert_not_called()
+
+    def test_server_time_wins_over_different_message_time(self):
+        msg = FakeMsg(
+            "alice",
+            "##debate2016",
+            "@codexdeep history",
+            timestamp=1787002228.0,
+            server_time="2026-08-17T21:30:27.950Z",
+        )
+        self.assertEqual(
+            self.plugin._soju_cutoff(msg),
+            ("2026-08-17T21:30:27.950Z", "server-time"),
+        )
+
+    def test_server_time_milliseconds_are_truncated_not_rounded_up(self):
+        msg = FakeMsg(
+            "alice",
+            "##debate2016",
+            "@codexdeep history",
+            server_time="2026-08-17T21:30:27.950999Z",
+        )
+        self.assertEqual(
+            self.plugin._soju_cutoff(msg),
+            ("2026-08-17T21:30:27.950Z", "server-time"),
+        )
+        self.assertIsNone(
+            self.plugin._normalized_utc_milliseconds(
+                "2026-08-17T17:30:27.950-04:00"
+            )
+        )
+        self.assertIsNone(
+            self.plugin._normalized_utc_milliseconds("2026-08-17T21:30:27.950")
+        )
+
+    def test_missing_server_time_uses_receive_time_safety_offset(self):
+        msg = FakeMsg(
+            "alice",
+            "##debate2016",
+            "@codexdeep history",
+            timestamp=1787002228.0,
+            server_time=None,
+        )
+        self.assertEqual(
+            self.plugin._soju_cutoff(msg),
+            ("2026-08-17T21:30:27.750Z", "receive-time-offset"),
+        )
+
+    def test_malformed_server_time_falls_back_and_logs_metadata_only(self):
+        msg = FakeMsg(
+            "alice",
+            "##debate2016",
+            "@codexdeep history",
+            timestamp=1787002228.0,
+            server_time="not-a-time",
+        )
+        with mock.patch.object(self.plugin.log, "warning") as warning:
+            with mock.patch.object(
+                self.plugin, "_invoke_wrapper", return_value="Answer"
+            ) as wrapped:
+                self.plugin._handle_codex_request(
+                    self.irc, msg, "What happened?", mode="deep"
+                )
+        self.assertEqual(
+            wrapped.call_args.kwargs["soju_cutoff"],
+            "2026-08-17T21:30:27.750Z",
+        )
+        warning.assert_any_call(
+            "Codex canonical history cutoff used source=%s",
+            "receive-time-offset",
+        )
+        self.assertNotIn("What happened?", str(warning.call_args_list))
+
+    def test_nonfinite_message_time_without_server_time_fails_closed(self):
+        for timestamp in (float("nan"), float("inf"), float("-inf")):
+            msg = FakeMsg(
+                "alice",
+                "##debate2016",
+                "@codexdeep history",
+                timestamp=timestamp,
+                server_time=None,
+            )
+            with self.assertRaises(WrapperExecutionError):
+                self.plugin._soju_cutoff(msg)
+
+    def test_deep_mode_rejects_other_channels(self):
+        self.plugin._handle_codex_request(
+            self.irc, self.msg, "What happened?", mode="deep"
+        )
+        self.assertEqual(
+            self.irc.replies,
+            ["@codexdeep is available only in Libera ##debate2016"],
+        )
 
     def test_high_mode_uses_high_prompt_and_shared_timeout(self):
         with mock.patch.object(self.plugin, "_invoke_wrapper", return_value="Answer") as wrapped:
@@ -673,8 +826,20 @@ class CodexPluginUnitTest(unittest.TestCase):
         )
         self.assertEqual(run_mock.call_args.args[1], "prompt text")
         self.assertIn("CODEX_WRAPPER_WRITE_BASE", run_mock.call_args.args[2])
+        self.assertNotIn("--soju-cutoff", run_mock.call_args.args[0])
 
-    def test_deep_subprocess_passes_only_prevalidated_log_dir(self):
+    def test_non_deep_wrapper_rejects_soju_cutoff(self):
+        with self.assertRaisesRegex(WrapperExecutionError, "only in deep mode"):
+            self.plugin._invoke_wrapper(
+                "/tmp/wrapper",
+                "prompt",
+                42,
+                self.plugin._resolve_runtime_write_paths(),
+                mode="terra",
+                soju_cutoff="2026-08-17T21:30:28.000Z",
+            )
+
+    def test_deep_subprocess_passes_prevalidated_transport_and_cutoff(self):
         completed = types.SimpleNamespace(returncode=0, stdout="wrapper output\n", stderr="")
 
         with mock.patch.object(self.plugin, "_run_child_process", return_value=completed) as run_mock:
@@ -684,8 +849,8 @@ class CodexPluginUnitTest(unittest.TestCase):
                 180,
                 self.plugin._resolve_runtime_write_paths(),
                 mode="deep",
-                log_dir=self.deep_channel,
-                log_cutoff="2024-11-05T12:34:56",
+                soju_transport_config=self.plugin._transport_config_path,
+                soju_cutoff="2026-08-17T21:30:28.000Z",
             )
 
         self.assertEqual(output, "wrapper output")
@@ -697,10 +862,10 @@ class CodexPluginUnitTest(unittest.TestCase):
                 "180",
                 "--mode",
                 "deep",
-                "--log-dir",
-                self.deep_channel,
-                "--log-cutoff",
-                "2024-11-05T12:34:56",
+                "--soju-transport-config",
+                self.plugin._transport_config_path,
+                "--soju-cutoff",
+                "2026-08-17T21:30:28.000Z",
             ],
         )
 
@@ -720,8 +885,8 @@ class CodexPluginUnitTest(unittest.TestCase):
                     180,
                     self.plugin._resolve_runtime_write_paths(),
                     mode="deep",
-                    log_dir=self.deep_channel,
-                    log_cutoff="2024-11-05T12:34:56",
+                    soju_transport_config=self.plugin._transport_config_path,
+                    soju_cutoff="2026-08-17T21:30:28.000Z",
                 )
 
     def test_high_mode_wrapper_uses_hardcoded_overrides(self):
@@ -788,7 +953,7 @@ class CodexWrapperUnitTest(unittest.TestCase):
         self.assertEqual(deep["model"], "gpt-5.6-luna")
         self.assertEqual(deep["reasoning_effort"], "high")
         self.assertEqual(deep["web_search"], "disabled")
-        self.assertTrue(deep["deep_logs"])
+        self.assertTrue(deep["soju_history"])
         self.assertNotIn("minimal", codex_wrapper.ALLOWED_REASONING_EFFORTS)
         self.assertIn("none", codex_wrapper.ALLOWED_REASONING_EFFORTS)
         self.assertIn("max", codex_wrapper.ALLOWED_REASONING_EFFORTS)
@@ -920,7 +1085,7 @@ class CodexWrapperUnitTest(unittest.TestCase):
             self.assertIn(f"features.{feature}=false", cmd)
         self.assertEqual(cmd[-1], "-")
 
-    def test_deep_exec_exposes_only_allowlisted_log_mcp_tools(self):
+    def test_deep_exec_exposes_only_allowlisted_soju_mcp_tools(self):
         settings = codex_wrapper._runtime_settings(codex_wrapper.MODE_DEEP)
         layout = {"agent_cwd": os.path.join(self.tmpdir, "agent-cwd")}
         cmd = codex_wrapper._exec_command(
@@ -933,44 +1098,60 @@ class CodexWrapperUnitTest(unittest.TestCase):
         self.assertIn('web_search="disabled"', cmd)
         self.assertIn("features.shell_tool=false", cmd)
         self.assertTrue(
-            any(item.startswith("mcp_servers.channel_logs.command=") for item in cmd)
+            any(item.startswith("mcp_servers.soju_history.command=") for item in cmd)
         )
         self.assertIn(
-            'mcp_servers.channel_logs.enabled_tools=["list_log_files","search_logs","read_log_lines"]',
+            'mcp_servers.soju_history.enabled_tools=["search","search_summary","history_summary","context","conversations","speaker_history","aggregate"]',
             cmd,
         )
         self.assertIn(
-            'mcp_servers.channel_logs.default_tools_approval_mode="approve"', cmd
+            'mcp_servers.soju_history.default_tools_approval_mode="approve"', cmd
         )
         self.assertIn(
-            'mcp_servers.channel_logs.env_vars=["CODEX_DEEP_LOG_DIR","CODEX_DEEP_LOG_CUTOFF"]',
+            'mcp_servers.soju_history.env_vars=["CODEX_SOJU_TRANSPORT_CONFIG","CODEX_SOJU_CUTOFF","CODEX_SOJU_TELEMETRY_PATH","CODEX_SOJU_REQUEST_ID"]',
             cmd,
         )
 
-    def test_deep_child_env_includes_only_selected_log_dir(self):
-        selected = os.path.join(self.tmpdir, "logs")
+    def test_deep_child_env_includes_transport_config_and_cutoff(self):
+        selected = os.path.join(self.tmpdir, "transport.json")
         layout = {
             "temp": self.tmpdir,
             "agent_cwd": os.path.join(self.tmpdir, "agent-cwd"),
+            "output": self.tmpdir,
         }
         child_env = codex_wrapper._codex_child_env(
             "/opt/codex/bin/codex",
             layout,
             code_home=self.runtime_home,
-            deep_log_dir=selected,
-            deep_log_cutoff="2024-11-05T12:34:56",
+            soju_transport_config=selected,
+            soju_cutoff="2026-08-17T21:30:28.000Z",
+            soju_request_id="request-abc123",
         )
-        self.assertEqual(child_env["CODEX_DEEP_LOG_DIR"], selected)
+        self.assertEqual(child_env["CODEX_SOJU_TRANSPORT_CONFIG"], selected)
         self.assertEqual(
-            child_env["CODEX_DEEP_LOG_CUTOFF"], "2024-11-05T12:34:56"
+            child_env["CODEX_SOJU_CUTOFF"], "2026-08-17T21:30:28.000Z"
         )
+        self.assertEqual(
+            child_env["CODEX_SOJU_TELEMETRY_PATH"],
+            os.path.join(self.tmpdir, "soju-tool-telemetry.jsonl"),
+        )
+        self.assertEqual(child_env["CODEX_SOJU_REQUEST_ID"], "request-abc123")
 
-    def test_deep_cutoff_defaults_for_pre_reload_plugin_compatibility(self):
-        with mock.patch.object(
-            codex_wrapper.time, "strftime", return_value="2024-11-05T12:34:56"
-        ):
-            cutoff = codex_wrapper._resolve_deep_log_cutoff(None)
-        self.assertEqual(cutoff, "2024-11-05T12:34:56")
+    def test_deep_transport_config_is_required(self):
+        with self.assertRaisesRegex(RuntimeError, "requires --soju-transport-config"):
+            codex_wrapper._resolve_soju_transport_config(None)
+
+    def test_deep_cutoff_is_required_and_validated(self):
+        with self.assertRaisesRegex(RuntimeError, "requires --soju-cutoff"):
+            codex_wrapper._resolve_soju_cutoff(None)
+        with self.assertRaisesRegex(RuntimeError, "malformed"):
+            codex_wrapper._resolve_soju_cutoff("not-a-time")
+        with self.assertRaisesRegex(RuntimeError, "must be UTC"):
+            codex_wrapper._resolve_soju_cutoff("2026-08-17T21:30:28-04:00")
+        self.assertEqual(
+            codex_wrapper._resolve_soju_cutoff("2026-08-17T21:30:28Z"),
+            "2026-08-17T21:30:28.000Z",
+        )
 
     def test_structured_error_detail_extracts_failed_turn_message(self):
         stream = "\n".join(
@@ -984,193 +1165,746 @@ class CodexWrapperUnitTest(unittest.TestCase):
             "Usage limit reached. Try again at 12:15 PM.",
         )
 
+    def test_turn_usage_extracts_exact_final_counters(self):
+        stream = "\n".join(
+            [
+                '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4}}',
+                "not json",
+                '{"type":"turn.completed","usage":{"input_tokens":250,"cached_input_tokens":80,"output_tokens":30,"reasoning_output_tokens":12,"cache_write_input_tokens":5}}',
+            ]
+        )
+        self.assertEqual(
+            codex_wrapper._turn_usage(stream),
+            {
+                "input_tokens": 250,
+                "cached_input_tokens": 80,
+                "output_tokens": 30,
+                "reasoning_output_tokens": 12,
+                "cache_write_input_tokens": 5,
+                "total_tokens": 280,
+            },
+        )
+        self.assertIsNone(codex_wrapper._turn_usage('{"type":"turn.started"}'))
 
-class DeepLogToolsUnitTest(unittest.TestCase):
-    def setUp(self):
-        self.tmpdir = tempfile.mkdtemp(prefix="codex-deep-tools-test-")
-        self.filename = "#test.2024-11-05.log"
-        with open(os.path.join(self.tmpdir, self.filename), "w", encoding="utf-8") as handle:
-            handle.write(
-                "12:00 alice: opening\n"
-                "12:01 thero: election claim\n"
-                "12:02 alice: disagreement\n"
-                "12:03 bob: context\n"
+    def test_sanitize_rate_limits_preserves_dynamic_buckets(self):
+        result = codex_wrapper._sanitize_rate_limits(
+            {
+                "rateLimitsByLimitId": {
+                    "codex": {
+                        "limitId": "codex",
+                        "limitName": None,
+                        "planType": "plus",
+                        "primary": {
+                            "usedPercent": 17,
+                            "windowDurationMins": 300,
+                            "resetsAt": 1780000000,
+                        },
+                        "secondary": None,
+                        "credits": {
+                            "hasCredits": False,
+                            "unlimited": False,
+                            "balance": "0",
+                            "futurePrivateField": "excluded",
+                        },
+                        "unrecognized": "excluded",
+                    },
+                    "another_model": {
+                        "limitId": "another_model",
+                        "limitName": "Another model",
+                        "primary": {"usedPercent": 3},
+                    },
+                },
+                "rateLimitResetCredits": {
+                    "availableCount": 2,
+                    "credits": [{"id": "private-credit-id"}],
+                },
+            }
+        )
+        self.assertEqual(set(result["buckets"]), {"codex", "another_model"})
+        self.assertEqual(
+            result["buckets"]["codex"]["primary"]["window_duration_minutes"],
+            300,
+        )
+        self.assertEqual(result["rate_limit_reset_credits_available"], 2)
+        rendered = json.dumps(result)
+        self.assertNotIn("futurePrivateField", rendered)
+        self.assertNotIn("private-credit-id", rendered)
+        self.assertNotIn("unrecognized", rendered)
+
+    def test_quota_snapshot_uses_documented_app_server_sequence(self):
+        fake_proc = types.SimpleNamespace(
+            stdin=io.BytesIO(),
+            stdout=object(),
+            pid=1234,
+        )
+        responses = [
+            ({"id": 1, "result": {"userAgent": "test"}}, b""),
+            (
+                {
+                    "id": 2,
+                    "result": {
+                        "rateLimits": {
+                            "limitId": "codex",
+                            "primary": {"usedPercent": 9},
+                        }
+                    },
+                },
+                b"",
+            ),
+        ]
+        with mock.patch.object(
+            codex_wrapper.subprocess, "Popen", return_value=fake_proc
+        ) as popen_mock, mock.patch.object(
+            codex_wrapper, "_read_rpc_response", side_effect=responses
+        ), mock.patch.object(codex_wrapper, "_stop_app_server") as stop_mock:
+            result = codex_wrapper._read_quota_snapshot(
+                "/opt/codex/bin/codex",
+                {"CODEX_HOME": self.source_home},
+                self.tmpdir,
             )
+
+        self.assertEqual(result["status"], "available")
+        self.assertEqual(result["buckets"]["codex"]["primary"]["used_percent"], 9)
+        self.assertEqual(
+            popen_mock.call_args.args[0],
+            ["/opt/codex/bin/codex", "app-server", "--listen", "stdio://"],
+        )
+        sent = fake_proc.stdin.getvalue().decode("utf-8")
+        self.assertIn('"method":"initialize"', sent)
+        self.assertIn('"method":"initialized"', sent)
+        self.assertIn('"method":"account/rateLimits/read"', sent)
+        self.assertNotIn("turn/start", sent)
+        stop_mock.assert_called_once_with(fake_proc)
+
+    def test_quota_snapshot_timeout_is_nonfatal(self):
+        fake_proc = types.SimpleNamespace(
+            stdin=io.BytesIO(),
+            stdout=object(),
+            pid=1234,
+        )
+        with mock.patch.object(
+            codex_wrapper.subprocess, "Popen", return_value=fake_proc
+        ), mock.patch.object(
+            codex_wrapper,
+            "_read_rpc_response",
+            side_effect=TimeoutError("slow"),
+        ), mock.patch.object(codex_wrapper, "_stop_app_server") as stop_mock:
+            result = codex_wrapper._read_quota_snapshot(
+                "/opt/codex/bin/codex",
+                {"CODEX_HOME": self.source_home},
+                self.tmpdir,
+            )
+
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["error"], "timeout")
+        stop_mock.assert_called_once_with(fake_proc)
+
+    def test_usage_record_is_private_jsonl(self):
+        layout = {"output": self.tmpdir}
+        record = {
+            "schema_version": 1,
+            "mode": "deep",
+            "tokens": {"total_tokens": 123},
+        }
+        self.assertTrue(codex_wrapper._append_usage_record(layout, record))
+        path = os.path.join(self.tmpdir, codex_wrapper.USAGE_LOG_FILENAME)
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        with open(path, "r", encoding="utf-8") as handle:
+            self.assertEqual(json.loads(handle.readline()), record)
+
+    def test_usage_record_rotates_at_size_limit(self):
+        layout = {"output": self.tmpdir}
+        path = os.path.join(self.tmpdir, codex_wrapper.USAGE_LOG_FILENAME)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("old telemetry")
+        with mock.patch.object(codex_wrapper, "USAGE_LOG_MAX_BYTES", 5):
+            self.assertTrue(
+                codex_wrapper._append_usage_record(layout, {"mode": "terra"})
+            )
+        with open(path + ".1", "r", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "old telemetry")
+        with open(path, "r", encoding="utf-8") as handle:
+            self.assertEqual(json.loads(handle.readline()), {"mode": "terra"})
+
+
+class IrclogsBotClientUnitTest(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="irclogs-client-test-")
+        self.identity = os.path.join(self.tmpdir, "identity")
+        self.known_hosts = os.path.join(self.tmpdir, "known_hosts")
+        self.config_path = os.path.join(self.tmpdir, "transport.json")
+        for path in (self.identity, self.known_hosts):
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("test material")
+            os.chmod(path, 0o600)
+        with open(self.config_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "destination": "bot@example.test",
+                    "identity_file": "identity",
+                    "known_hosts_file": "known_hosts",
+                },
+                handle,
+            )
+        os.chmod(self.config_path, 0o600)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_loads_fixed_private_transport_config(self):
+        with mock.patch.dict(
+            os.environ, {irclogs_bot_client.CONFIG_ENV: self.config_path}, clear=False
+        ):
+            destination, identity, known_hosts = irclogs_bot_client._load_config()
+        self.assertEqual(destination, "bot@example.test")
+        self.assertEqual(identity, self.identity)
+        self.assertEqual(known_hosts, self.known_hosts)
+
+    def test_rejects_unknown_config_fields(self):
+        with open(self.config_path, "r+", encoding="utf-8") as handle:
+            config = json.load(handle)
+            config["remote_command"] = "forbidden"
+            handle.seek(0)
+            json.dump(config, handle)
+            handle.truncate()
+        with mock.patch.dict(
+            os.environ, {irclogs_bot_client.CONFIG_ENV: self.config_path}, clear=False
+        ):
+            with self.assertRaisesRegex(RuntimeError, "unexpected fields"):
+                irclogs_bot_client._load_config()
+
+    def test_rejects_group_readable_identity(self):
+        os.chmod(self.identity, 0o640)
+        with mock.patch.dict(
+            os.environ, {irclogs_bot_client.CONFIG_ENV: self.config_path}, clear=False
+        ):
+            with self.assertRaisesRegex(RuntimeError, "permissions are too broad"):
+                irclogs_bot_client._load_config()
+
+
+class SojuHistoryToolsUnitTest(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="soju-history-tools-test-")
+        self.config_path = os.path.join(self.tmpdir, "transport.json")
+        with open(self.config_path, "w", encoding="utf-8") as handle:
+            handle.write("{}")
         self.env_patch = mock.patch.dict(
-            os.environ, {deep_log_tools.LOG_DIR_ENV: self.tmpdir}, clear=False
+            os.environ,
+            {
+                soju_history_tools.TRANSPORT_CONFIG_ENV: self.config_path,
+                soju_history_tools.CUTOFF_ENV: "2026-08-17T21:30:28.000Z",
+            },
+            clear=False,
         )
         self.env_patch.start()
-        deep_log_tools._tool_call_count = 0
+        soju_history_tools._tool_call_count = 0
 
     def tearDown(self):
         self.env_patch.stop()
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
-    def test_lists_searches_and_reads_logs(self):
-        listing = deep_log_tools.list_log_files({"file_pattern": "*2024-11-05.log"})
-        self.assertIn(self.filename, listing)
-
-        matches = deep_log_tools.search_logs(
+    def test_exposes_only_canonical_history_tools_with_policy_caps(self):
+        definitions = {
+            item["name"]: item for item in soju_history_tools._tool_definitions()
+        }
+        self.assertEqual(
+            set(definitions),
             {
-                "query": "THERO",
-                "file_pattern": "*2024-11-05.log",
-                "context_lines": 1,
-            }
-        )
-        self.assertIn("2: 12:01 thero: election claim", matches)
-        self.assertIn("3: 12:02 alice: disagreement", matches)
-
-        excerpt = deep_log_tools.read_log_lines(
-            {"filename": self.filename, "start_line": 2, "line_count": 2}
-        )
-        self.assertIn("2: 12:01 thero: election claim", excerpt)
-        self.assertIn("3: 12:02 alice: disagreement", excerpt)
-
-    def test_search_pagination_reaches_later_matches(self):
-        first_page = deep_log_tools.search_logs(
-            {
-                "query": "alice:",
-                "max_matches": 1,
-                "context_lines": 0,
-            }
-        )
-        self.assertIn("1: 12:00 alice: opening", first_page)
-        self.assertNotIn("3: 12:02 alice: disagreement", first_page)
-        self.assertIn("repeat search_logs with match_offset=1", first_page)
-
-        second_page = deep_log_tools.search_logs(
-            {
-                "query": "alice:",
-                "match_offset": 1,
-                "max_matches": 1,
-                "context_lines": 0,
-            }
-        )
-        self.assertNotIn("1: 12:00 alice: opening", second_page)
-        self.assertIn("3: 12:02 alice: disagreement", second_page)
-        self.assertIn("no more matches are available", second_page)
-
-        exhausted = deep_log_tools.search_logs(
-            {
-                "query": "alice:",
-                "match_offset": 2,
-                "max_matches": 1,
-                "context_lines": 0,
-            }
+                "search",
+                "search_summary",
+                "history_summary",
+                "context",
+                "conversations",
+                "speaker_history",
+                "aggregate",
+            },
         )
         self.assertEqual(
-            exhausted,
-            "No matching log lines at or after match_offset 2.",
+            definitions["search"]["inputSchema"]["properties"]["limit"]["maximum"],
+            20,
         )
+        self.assertEqual(
+            definitions["conversations"]["inputSchema"]["properties"]["limit"]["maximum"],
+            5,
+        )
+        self.assertEqual(
+            definitions["speaker_history"]["inputSchema"]["properties"]["limit"]["maximum"],
+            80,
+        )
+        self.assertEqual(
+            definitions["aggregate"]["inputSchema"]["properties"]["limit"]["maximum"],
+            50,
+        )
+        aggregate_properties = definitions["aggregate"]["inputSchema"]["properties"]
+        self.assertIn("summary_only", aggregate_properties)
+        self.assertEqual(aggregate_properties["summary_only"]["type"], "boolean")
+        self.assertNotIn("to_time", aggregate_properties)
+        for definition in definitions.values():
+            self.assertFalse(definition["inputSchema"]["additionalProperties"])
+            self.assertNotIn("to_time", definition["inputSchema"]["properties"])
+        history_properties = definitions["history_summary"]["inputSchema"][
+            "properties"
+        ]
+        self.assertEqual(set(history_properties), {"from_time", "until_time"})
+        for forbidden in (
+            "query",
+            "limit",
+            "order",
+            "sender",
+            "scope",
+            "target",
+            "network",
+        ):
+            self.assertNotIn(forbidden, history_properties)
 
-    def test_search_exact_page_size_does_not_claim_more_matches(self):
-        result = deep_log_tools.search_logs(
+    def test_speaker_history_maps_to_hyphenated_transport_command(self):
+        completed = types.SimpleNamespace(
+            returncode=0,
+            stdout='{"type":"speaker_meta","messages":0}\n',
+        )
+        with mock.patch.object(
+            soju_history_tools.subprocess, "run", return_value=completed
+        ) as run_mock:
+            result = soju_history_tools._call_transport(
+                "speaker-history",
+                {"speaker_group": ["alice"], "mode": "sample", "limit": 10},
+            )
+        request = json.loads(run_mock.call_args.kwargs["input"])
+        self.assertEqual(request["command"], "speaker-history")
+        self.assertEqual(request["speaker_group"], ["alice"])
+        self.assertEqual(request["limit"], 10)
+        self.assertEqual(request["to_time"], "2026-08-17T21:30:28.000Z")
+        self.assertIn('"speaker_meta"', result)
+        child_env = run_mock.call_args.kwargs["env"]
+        self.assertEqual(child_env["CODEX_SOJU_TRANSPORT_CONFIG"], self.config_path)
+        self.assertNotIn("CODEX_HOME", child_env)
+
+    def test_search_summary_preserves_zero_one_and_two_edge_messages(self):
+        cases = (
+            (
+                0,
+                '{"type":"search_meta","matching_messages":0,'
+                '"messages_returned":0,"effective_to_time":'
+                '"2026-08-17T21:30:28.000Z"}\n',
+                [],
+            ),
+            (
+                1,
+                '{"type":"search_meta","matching_messages":1,'
+                '"messages_returned":1,"effective_to_time":'
+                '"2026-08-17T21:30:28.000Z"}\n'
+                '{"id":41,"time":"2021-01-02T03:04:05.000Z",'
+                '"sender":"alice","text":"evidence one",'
+                '"edge":"first_and_last"}\n',
+                ["first_and_last"],
+            ),
+            (
+                2,
+                '{"type":"search_meta","matching_messages":544,'
+                '"messages_returned":2,"effective_to_time":'
+                '"2026-08-17T21:30:28.000Z"}\n'
+                '{"id":41,"time":"2021-01-02T03:04:05.000Z",'
+                '"sender":"alice","text":"first evidence","edge":"first"}\n'
+                '{"id":99,"time":"2025-06-07T08:09:10.000Z",'
+                '"sender":"bob","text":"last evidence","edge":"last"}\n',
+                ["first", "last"],
+            ),
+        )
+        for expected_messages, stdout, expected_edges in cases:
+            completed = types.SimpleNamespace(returncode=0, stdout=stdout)
+            with mock.patch.object(
+                soju_history_tools.subprocess, "run", return_value=completed
+            ) as run_mock:
+                rendered = soju_history_tools._call_transport(
+                    "search-summary", {"query": "topic-alpha"}
+                )
+            records = [json.loads(line) for line in rendered.splitlines()]
+            self.assertEqual(records[0]["messages_returned"], expected_messages)
+            self.assertEqual(
+                [record["edge"] for record in records[1:]], expected_edges
+            )
+            if expected_messages == 2:
+                self.assertEqual(records[0]["matching_messages"], 544)
+                self.assertEqual(records[1]["id"], 41)
+                self.assertEqual(records[2]["time"], "2025-06-07T08:09:10.000Z")
+            request = json.loads(run_mock.call_args.kwargs["input"])
+            self.assertEqual(request["command"], "search-summary")
+            self.assertNotIn("limit", request)
+            self.assertNotIn("order", request)
+
+    def test_history_summary_preserves_zero_one_and_two_boundaries_and_null_text(self):
+        cases = (
+            (
+                '{"type":"history_meta","matching_messages":0,'
+                '"first_time":null,"last_time":null,"messages_returned":0,'
+                '"from_time":null,"effective_to_time":'
+                '"2026-08-17T21:30:28.000Z"}\n',
+                [],
+            ),
+            (
+                '{"type":"history_meta","matching_messages":1,'
+                '"first_time":"2020-01-01T00:00:00.000Z",'
+                '"last_time":"2020-01-01T00:00:00.000Z",'
+                '"messages_returned":1,"from_time":null,'
+                '"effective_to_time":"2026-08-17T21:30:28.000Z"}\n'
+                '{"id":1,"time":"2020-01-01T00:00:00.000Z",'
+                '"network":"libera","target":"##debate2016",'
+                '"sender":"alice","text":"only message",'
+                '"edge":"first_and_last"}\n',
+                ["first_and_last"],
+            ),
+            (
+                '{"type":"history_meta","matching_messages":3291018,'
+                '"first_time":"2018-04-17T00:32:56.000Z",'
+                '"last_time":"2026-08-17T21:30:27.000Z",'
+                '"messages_returned":2,"from_time":null,'
+                '"effective_to_time":"2026-08-17T21:30:28.000Z"}\n'
+                '{"id":1,"time":"2018-04-17T00:32:56.000Z",'
+                '"network":"freenode","target":"#debate2016",'
+                '"sender":"server","text":null,"edge":"first"}\n'
+                '{"id":2,"time":"2026-08-17T21:30:27.000Z",'
+                '"network":"libera","target":"##debate2016",'
+                '"sender":"alice","text":"latest message","edge":"last"}\n',
+                ["first", "last"],
+            ),
+        )
+        for stdout, expected_edges in cases:
+            completed = types.SimpleNamespace(returncode=0, stdout=stdout)
+            with mock.patch.object(
+                soju_history_tools.subprocess, "run", return_value=completed
+            ) as run_mock:
+                rendered = soju_history_tools._call_transport(
+                    "history-summary",
+                    {
+                        "from_time": "2018-01-01T00:00:00Z",
+                        "until_time": "2030-01-01T00:00:00Z",
+                    },
+                )
+            records = [json.loads(line) for line in rendered.splitlines()]
+            self.assertEqual(
+                [record["edge"] for record in records[1:]], expected_edges
+            )
+            request = json.loads(run_mock.call_args.kwargs["input"])
+            self.assertEqual(
+                request,
+                {
+                    "command": "history-summary",
+                    "from_time": "2018-01-01T00:00:00.000Z",
+                    "to_time": "2026-08-17T21:30:28.000Z",
+                },
+            )
+            if len(records) == 3:
+                self.assertEqual(records[0]["matching_messages"], 3291018)
+                self.assertIsNone(records[1]["text"])
+                self.assertEqual(records[1]["id"], 1)
+                self.assertEqual(records[2]["edge"], "last")
+                telemetry = soju_history_tools._response_telemetry(records)
+                self.assertEqual(telemetry["matching_messages"], 3291018)
+                self.assertEqual(telemetry["messages_returned"], 2)
+
+    def test_context_schema_and_request_are_bounded_and_scope_free(self):
+        context_schema = soju_history_tools.TOOLS["context"]["inputSchema"]
+        properties = context_schema["properties"]
+        self.assertEqual(properties["id"]["minimum"], 1)
+        self.assertEqual(properties["before"]["maximum"], 8)
+        self.assertEqual(properties["after"]["maximum"], 12)
+        for forbidden in ("network", "target", "scope", "to_time"):
+            self.assertNotIn(forbidden, properties)
+
+        completed = types.SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '{"type":"context_meta","anchor_id":6420021,"before":6,'
+                '"after":10,"messages_returned":1,"network":"freenode",'
+                '"target":"#debate2016"}\n'
+                '{"id":6420021,"time":"2020-01-01T00:00:00.000Z",'
+                '"sender":"alice","text":"anchor evidence","match":true,'
+                '"network":"freenode","target":"#debate2016"}\n'
+            ),
+        )
+        with mock.patch.object(
+            soju_history_tools.subprocess, "run", return_value=completed
+        ) as run_mock:
+            rendered = soju_history_tools._call_transport(
+                "context",
+                {
+                    "id": 6420021,
+                    "before": 6,
+                    "after": 10,
+                    "to_time": "2099-01-01T00:00:00.000Z",
+                },
+            )
+        request = json.loads(run_mock.call_args.kwargs["input"])
+        self.assertEqual(
+            request,
+            {"command": "context", "id": 6420021, "before": 6, "after": 10},
+        )
+        records = [json.loads(line) for line in rendered.splitlines()]
+        self.assertEqual(records[0]["network"], "freenode")
+        self.assertEqual(records[1]["id"], 6420021)
+        self.assertEqual(records[1]["time"], "2020-01-01T00:00:00.000Z")
+        self.assertEqual(records[1]["text"], "anchor evidence")
+        self.assertTrue(records[1]["match"])
+        self.assertNotIn("network", records[1])
+        self.assertNotIn("target", records[1])
+
+        for field in ("network", "target", "scope"):
+            with self.assertRaisesRegex(soju_history_tools.ToolError, "scope is fixed"):
+                soju_history_tools._prepare_request(
+                    "context", {"id": 6420021, field: "injected"}
+                )
+
+    def test_date_ranges_are_normalized_and_capped_by_trusted_cutoff(self):
+        request = soju_history_tools._prepare_request(
+            "search-summary",
             {
-                "query": "alice:",
-                "max_matches": 2,
-                "context_lines": 0,
-            }
+                "query": "topic-alpha",
+                "from_time": "2020-01-01T00:00:00Z",
+                "until_time": "2030-01-01T00:00:00.000Z",
+                "to_time": "2099-01-01T00:00:00.000Z",
+            },
         )
-        self.assertNotIn("more matches are available", result)
-        self.assertNotIn("match_offset=", result)
+        self.assertEqual(request["from_time"], "2020-01-01T00:00:00.000Z")
+        self.assertEqual(request["to_time"], "2026-08-17T21:30:28.000Z")
+        self.assertNotIn("until_time", request)
 
-    def test_search_filters_speaker_orders_newest_and_uses_asymmetric_context(self):
-        result = deep_log_tools.search_logs(
+        earlier = soju_history_tools._prepare_request(
+            "aggregate",
             {
-                "speaker": "ALICE",
-                "sort_order": "newest_first",
-                "max_matches": 1,
-                "before_lines": 0,
-                "after_lines": 1,
-            }
+                "group_by": "year",
+                "until_time": "2024-01-01T00:00:00Z",
+            },
         )
-        self.assertIn("EVENT 1", result)
-        self.assertIn(">3: 12:02 alice: disagreement", result)
-        self.assertIn(" 4: 12:03 bob: context", result)
-        self.assertNotIn("1: 12:00 alice: opening", result)
+        self.assertEqual(earlier["to_time"], "2024-01-01T00:00:00.000Z")
 
-    def test_cutoff_excludes_triggering_minute_from_search_and_read(self):
+    def test_invalid_or_reversed_date_ranges_are_rejected(self):
+        for arguments in (
+            {"query": "x", "from_time": "not-a-time"},
+            {"query": "x", "until_time": "2026-01-01"},
+            {
+                "query": "x",
+                "from_time": "2024-01-01T00:00:00Z",
+                "until_time": "2024-01-01T00:00:00Z",
+            },
+            {
+                "query": "x",
+                "from_time": "2025-01-01T00:00:00Z",
+                "until_time": "2024-01-01T00:00:00Z",
+            },
+        ):
+            with self.assertRaises(soju_history_tools.ToolError):
+                soju_history_tools._prepare_request("search", arguments)
+
+    def test_exclude_senders_is_only_available_on_supported_operations(self):
+        supported = {"search", "search_summary", "conversations", "aggregate"}
+        for name, tool in soju_history_tools.TOOLS.items():
+            properties = tool["inputSchema"]["properties"]
+            self.assertEqual("exclude_senders" in properties, name in supported)
+        request = soju_history_tools._prepare_request(
+            "aggregate",
+            {"group_by": "sender", "exclude_senders": ["bot_a", "bot_b"]},
+        )
+        self.assertEqual(request["exclude_senders"], ["bot_a", "bot_b"])
+        with self.assertRaisesRegex(soju_history_tools.ToolError, "not supported"):
+            soju_history_tools._prepare_request(
+                "speaker-history",
+                {"speaker_group": ["alice"], "exclude_senders": ["bot_a"]},
+            )
+
+    def test_aggregate_supports_week_and_year_with_monday_description(self):
+        aggregate = soju_history_tools.TOOLS["aggregate"]
+        choices = aggregate["inputSchema"]["properties"]["group_by"]["enum"]
+        self.assertEqual(choices, ["sender", "day", "week", "month", "year"])
+        self.assertIn("UTC Monday date", aggregate["description"])
+        self.assertIn("not an ISO week number", aggregate["description"])
+
+    def test_compact_conversation_preserves_completeness_and_evidence(self):
+        records = [
+            {
+                "type": "conversation_meta",
+                "candidates_returned": 1,
+                "candidates_truncated": False,
+                "scan_complete": True,
+            },
+            {
+                "type": "conversation",
+                "network": "libera",
+                "target": "##debate2016",
+                "messages": [
+                    {
+                        "id": 7,
+                        "time": "2025-01-01T00:00:00.000Z",
+                        "sender": "alice",
+                        "text": "preserved evidence",
+                        "match": True,
+                        "network": "libera",
+                        "target": "##debate2016",
+                    }
+                ],
+            },
+        ]
+        compact = soju_history_tools._compact_records("conversations", records)
+        self.assertTrue(compact[0]["scan_complete"])
+        message = compact[1]["messages"][0]
+        self.assertEqual(message["id"], 7)
+        self.assertEqual(message["time"], "2025-01-01T00:00:00.000Z")
+        self.assertEqual(message["text"], "preserved evidence")
+        self.assertTrue(message["match"])
+        self.assertNotIn("network", message)
+        self.assertNotIn("target", message)
+
+    def test_tool_telemetry_contains_metadata_but_no_query_or_message_body(self):
+        telemetry_path = os.path.join(self.tmpdir, "soju-tool-telemetry.jsonl")
+        completed = types.SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '{"type":"search_meta","matching_messages":1,'
+                '"messages_returned":1}\n'
+                '{"id":7,"time":"2025-01-01T00:00:00.000Z",'
+                '"sender":"alice","text":"SECRET MESSAGE BODY",'
+                '"edge":"first_and_last"}\n'
+            ),
+        )
         with mock.patch.dict(
             os.environ,
-            {deep_log_tools.LOG_CUTOFF_ENV: "2024-11-05T12:02:30"},
+            {
+                soju_history_tools.TELEMETRY_PATH_ENV: telemetry_path,
+                soju_history_tools.REQUEST_ID_ENV: "parent-request-123",
+            },
             clear=False,
+        ), mock.patch.object(
+            soju_history_tools.subprocess, "run", return_value=completed
         ):
-            result = deep_log_tools.search_logs(
-                {"query": "alice:", "context_lines": 0}
+            soju_history_tools._call_transport(
+                "search-summary",
+                {"query": "SECRET QUERY TEXT"},
+                call_index=4,
             )
-            excerpt = deep_log_tools.read_log_lines(
-                {"filename": self.filename, "start_line": 1, "line_count": 4}
-            )
-        self.assertIn("12:00 alice: opening", result)
-        self.assertNotIn("12:02 alice: disagreement", result)
-        self.assertIn("12:01 thero: election claim", excerpt)
-        self.assertNotIn("12:02 alice: disagreement", excerpt)
+            with self.assertRaises(soju_history_tools.ToolError):
+                soju_history_tools._call_transport(
+                    "search",
+                    {
+                        "query": "ANOTHER SECRET QUERY",
+                        "from_time": "2025-01-01T00:00:00Z",
+                        "until_time": "2024-01-01T00:00:00Z",
+                    },
+                    call_index=5,
+                )
+        with open(telemetry_path, "r", encoding="utf-8") as handle:
+            telemetry_text = handle.read()
+        telemetry_records = [
+            json.loads(line) for line in telemetry_text.splitlines()
+        ]
+        telemetry = telemetry_records[0]
+        self.assertEqual(telemetry["tool"], "search-summary")
+        self.assertEqual(telemetry["status"], "success")
+        self.assertRegex(
+            telemetry["started_at"],
+            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$",
+        )
+        self.assertEqual(telemetry["request_id"], "parent-request-123")
+        self.assertEqual(telemetry["call_index"], 4)
+        self.assertEqual(telemetry["matching_messages"], 1)
+        self.assertEqual(telemetry["messages_returned"], 1)
+        self.assertIn("duration_ms", telemetry)
+        self.assertIn("response_bytes", telemetry)
+        self.assertEqual(telemetry_records[1]["status"], "rejection")
+        self.assertEqual(telemetry_records[1]["tool"], "search")
+        self.assertEqual(telemetry_records[1]["request_id"], "parent-request-123")
+        self.assertEqual(telemetry_records[1]["call_index"], 5)
+        self.assertNotIn("SECRET QUERY TEXT", telemetry_text)
+        self.assertNotIn("ANOTHER SECRET QUERY", telemetry_text)
+        self.assertNotIn("SECRET MESSAGE BODY", telemetry_text)
 
-    def test_tool_call_budget_stops_runaway_search(self):
+    def test_transport_cutoff_overwrites_argument_value(self):
+        completed = types.SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '{"matching_messages":2089,"groups_total":839,'
+                '"groups_returned":0,"groups_truncated":false,'
+                '"summary_only":true}\n'
+            ),
+        )
+        with mock.patch.object(
+            soju_history_tools.subprocess, "run", return_value=completed
+        ) as run_mock:
+            result = soju_history_tools._call_transport(
+                "aggregate",
+                {
+                    "query": "topic-beta",
+                    "group_by": "day",
+                    "summary_only": True,
+                    "to_time": "1900-01-01T00:00:00.000Z",
+                },
+            )
+        request = json.loads(run_mock.call_args.kwargs["input"])
+        self.assertEqual(request["to_time"], "2026-08-17T21:30:28.000Z")
+        response = json.loads(result)
+        self.assertEqual(response["groups_total"], 839)
+        self.assertEqual(response["matching_messages"], 2089)
+
+    def test_missing_or_malformed_transport_cutoff_fails_closed(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(soju_history_tools.CUTOFF_ENV, None)
+            with self.assertRaises(soju_history_tools.ToolError):
+                soju_history_tools._trusted_cutoff()
+        for value in ("not-a-time", "2026-08-17T21:30:28-04:00"):
+            with mock.patch.dict(
+                os.environ, {soju_history_tools.CUTOFF_ENV: value}, clear=False
+            ):
+                with self.assertRaises(soju_history_tools.ToolError):
+                    soju_history_tools._trusted_cutoff()
+
+    def test_remote_policy_error_is_returned_safely(self):
+        completed = types.SimpleNamespace(
+            returncode=0,
+            stdout='{"error":"order must be asc or desc"}\n',
+        )
+        with mock.patch.object(
+            soju_history_tools.subprocess, "run", return_value=completed
+        ):
+            with self.assertRaisesRegex(
+                soju_history_tools.ToolError, "order must be asc or desc"
+            ):
+                soju_history_tools._call_transport(
+                    "search", {"query": "needle", "order": "sideways"}
+                )
+
+    def test_empty_success_is_a_clear_no_match(self):
+        completed = types.SimpleNamespace(returncode=0, stdout="")
+        with mock.patch.object(
+            soju_history_tools.subprocess, "run", return_value=completed
+        ):
+            result = soju_history_tools._call_transport(
+                "search", {"query": "missing"}
+            )
+        self.assertEqual(result, "No matching history was found.")
+
+    def test_transport_timeout_is_safe(self):
+        with mock.patch.object(
+            soju_history_tools.subprocess,
+            "run",
+            side_effect=TimeoutExpired(cmd="client", timeout=30),
+        ):
+            with self.assertRaisesRegex(soju_history_tools.ToolError, "timed out"):
+                soju_history_tools._call_transport("aggregate", {})
+
+    def test_mcp_budget_stops_runaway_queries(self):
         request = {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": {"name": "search_logs", "arguments": {"query": "alice"}},
+            "params": {"name": "aggregate", "arguments": {}},
         }
-        with mock.patch.object(deep_log_tools, "MAX_TOOL_CALLS", 2), mock.patch.object(
-            deep_log_tools, "TOOL_BUDGET_WARNING_CALL", 1
-        ):
-            first = deep_log_tools._handle_request(request)
-            second = deep_log_tools._handle_request(request)
-            third = deep_log_tools._handle_request(request)
+        with mock.patch.object(soju_history_tools, "MAX_TOOL_CALLS", 1), mock.patch.object(
+            soju_history_tools, "_call_transport", return_value="metadata"
+        ) as call_mock:
+            first = soju_history_tools._handle_request(request)
+            second = soju_history_tools._handle_request(request)
         self.assertFalse(first["result"]["isError"])
-        self.assertIn("1 tool calls remain", first["result"]["content"][1]["text"])
-        self.assertFalse(second["result"]["isError"])
-        self.assertTrue(third["result"]["isError"])
-        self.assertIn("budget exhausted", third["result"]["content"][0]["text"])
+        self.assertTrue(second["result"]["isError"])
+        call_mock.assert_called_once_with("aggregate", {}, call_index=1)
 
-    def test_search_safety_truncation_preserves_pagination_cursor(self):
-        with mock.patch.object(deep_log_tools, "MAX_RESPONSE_CHARS", 180):
-            result = deep_log_tools.search_logs(
-                {
-                    "query": ":",
-                    "max_matches": 1,
-                    "context_lines": 1,
-                }
-            )
-        self.assertLessEqual(len(result), 180)
-        self.assertIn("tool output truncated at safety limit", result)
-        self.assertTrue(result.endswith("match_offset=1]"))
-
-    def test_output_limit_cursor_does_not_skip_unreturned_events(self):
-        with mock.patch.object(deep_log_tools, "MAX_RESPONSE_CHARS", 120):
-            result = deep_log_tools.search_logs(
-                {
-                    "query": "alice:",
-                    "max_matches": 2,
-                    "context_lines": 0,
-                }
-            )
-        self.assertIn("match_offset=1", result)
-        self.assertNotIn("match_offset=2", result)
-
-    def test_rejects_directory_traversal_and_symlinks(self):
-        with self.assertRaises(deep_log_tools.ToolError):
-            deep_log_tools.read_log_lines(
-                {"filename": "../secret.log", "start_line": 1}
-            )
-
-        outside = os.path.join(os.path.dirname(self.tmpdir), "outside.log")
-        with open(outside, "w", encoding="utf-8") as handle:
-            handle.write("secret\n")
-        link = os.path.join(self.tmpdir, "linked.log")
-        try:
-            os.symlink(outside, link)
-            with self.assertRaises(deep_log_tools.ToolError):
-                deep_log_tools.read_log_lines(
-                    {"filename": "linked.log", "start_line": 1}
-                )
-        finally:
-            try:
-                os.unlink(outside)
-            except OSError:
-                pass
 
 
 if __name__ == "__main__":

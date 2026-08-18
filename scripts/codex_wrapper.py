@@ -5,6 +5,7 @@ import argparse
 import glob
 import json
 import os
+import select
 import signal
 import shutil
 import subprocess
@@ -12,7 +13,8 @@ import sys
 import tempfile
 import time
 import types
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 
 
 DEFAULT_TIMEOUT_SECONDS = 90
@@ -32,6 +34,11 @@ ALLOWED_MODES = (MODE_TERRA, MODE_TERRA_HIGH, MODE_LUNA, MODE_LUNA_HIGH, MODE_DE
 ALLOWED_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 ALLOWED_WEB_SEARCH_CONTEXT_SIZES = ("low", "medium", "high")
 NON_FATAL_ROLLOUT_ERROR = "failed to record rollout items:"
+USAGE_LOG_FILENAME = "usage-telemetry.jsonl"
+USAGE_LOG_MAX_BYTES = 5_000_000
+QUOTA_TIMEOUT_SECONDS = 5
+MAX_QUOTA_BUCKETS = 20
+MAX_RPC_BUFFER_BYTES = 1_000_000
 EXEC_DISABLED_FEATURES = (
     "shell_tool",
     "apps",
@@ -74,12 +81,26 @@ MODE_PRESETS = {
         "reasoning_effort": "high",
         "web_search": "disabled",
         "web_search_context_size": None,
-        "deep_logs": True,
+        "soju_history": True,
     },
 }
 
-DEEP_TOOLS_PATH = os.path.join(os.path.dirname(__file__), "deep_log_tools.py")
-DEEP_TOOL_NAMES = ("list_log_files", "search_logs", "read_log_lines")
+SOJU_TOOLS_PATH = os.path.join(
+    os.path.dirname(__file__), "soju_history_tools.py"
+)
+SOJU_TOOL_NAMES = (
+    "search",
+    "search_summary",
+    "history_summary",
+    "context",
+    "conversations",
+    "speaker_history",
+    "aggregate",
+)
+SOJU_TRANSPORT_CONFIG_ENV = "CODEX_SOJU_TRANSPORT_CONFIG"
+SOJU_CUTOFF_ENV = "CODEX_SOJU_CUTOFF"
+SOJU_TELEMETRY_PATH_ENV = "CODEX_SOJU_TELEMETRY_PATH"
+SOJU_REQUEST_ID_ENV = "CODEX_SOJU_REQUEST_ID"
 
 
 def _positive_int(value):
@@ -233,7 +254,12 @@ def _resolve_exec_codex_home():
 
 
 def _codex_child_env(
-    codex_binary, layout, code_home, deep_log_dir=None, deep_log_cutoff=None
+    codex_binary,
+    layout,
+    code_home,
+    soju_transport_config=None,
+    soju_cutoff=None,
+    soju_request_id=None,
 ):
     inherited_keys = (
         "HOME",
@@ -261,10 +287,16 @@ def _codex_child_env(
     run_env.setdefault("TERM", "dumb")
     run_env.setdefault("NO_COLOR", "1")
     run_env["PWD"] = layout["agent_cwd"]
-    if deep_log_dir:
-        run_env["CODEX_DEEP_LOG_DIR"] = deep_log_dir
-    if deep_log_cutoff:
-        run_env["CODEX_DEEP_LOG_CUTOFF"] = deep_log_cutoff
+    if soju_transport_config:
+        run_env[SOJU_TRANSPORT_CONFIG_ENV] = soju_transport_config
+    if soju_cutoff:
+        run_env[SOJU_CUTOFF_ENV] = soju_cutoff
+    if soju_transport_config and soju_cutoff:
+        run_env[SOJU_TELEMETRY_PATH_ENV] = os.path.join(
+            layout["output"], "soju-tool-telemetry.jsonl"
+        )
+        if soju_request_id:
+            run_env[SOJU_REQUEST_ID_ENV] = str(soju_request_id)
     return run_env
 
 
@@ -310,26 +342,30 @@ def _exec_command(codex_binary, settings, layout, output_path):
     for feature in EXEC_DISABLED_FEATURES:
         cmd.extend(("-c", f"features.{feature}=false"))
 
-    if settings.get("deep_logs"):
-        enabled_tools = ",".join(_toml_string(name) for name in DEEP_TOOL_NAMES)
+    if settings.get("soju_history"):
+        enabled_tools = ",".join(_toml_string(name) for name in SOJU_TOOL_NAMES)
         cmd.extend(
             (
                 "-c",
-                f"mcp_servers.channel_logs.command={_toml_string(sys.executable)}",
+                f"mcp_servers.soju_history.command={_toml_string(sys.executable)}",
                 "-c",
-                f"mcp_servers.channel_logs.args=[{_toml_string(DEEP_TOOLS_PATH)}]",
+                f"mcp_servers.soju_history.args=[{_toml_string(SOJU_TOOLS_PATH)}]",
                 "-c",
-                'mcp_servers.channel_logs.env_vars=["CODEX_DEEP_LOG_DIR","CODEX_DEEP_LOG_CUTOFF"]',
+                (
+                    'mcp_servers.soju_history.env_vars=['
+                    f'"{SOJU_TRANSPORT_CONFIG_ENV}","{SOJU_CUTOFF_ENV}",'
+                    f'"{SOJU_TELEMETRY_PATH_ENV}","{SOJU_REQUEST_ID_ENV}"]'
+                ),
                 "-c",
-                "mcp_servers.channel_logs.required=true",
+                "mcp_servers.soju_history.required=true",
                 "-c",
-                f"mcp_servers.channel_logs.enabled_tools=[{enabled_tools}]",
+                f"mcp_servers.soju_history.enabled_tools=[{enabled_tools}]",
                 "-c",
-                'mcp_servers.channel_logs.default_tools_approval_mode="approve"',
+                'mcp_servers.soju_history.default_tools_approval_mode="approve"',
                 "-c",
-                "mcp_servers.channel_logs.startup_timeout_sec=10",
+                "mcp_servers.soju_history.startup_timeout_sec=10",
                 "-c",
-                "mcp_servers.channel_logs.tool_timeout_sec=30",
+                "mcp_servers.soju_history.tool_timeout_sec=35",
             )
         )
 
@@ -383,6 +419,276 @@ def _structured_error_detail(text):
                     messages.append(candidate)
 
     return " | ".join(messages)[-2000:]
+
+
+def _turn_usage(text):
+    """Return the final exact token counters from a codex exec JSONL stream."""
+    usage = None
+    for line in (text or "").splitlines():
+        try:
+            event = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(event, dict) or event.get("type") != "turn.completed":
+            continue
+        candidate = event.get("usage")
+        if isinstance(candidate, dict):
+            usage = candidate
+
+    if usage is None:
+        return None
+
+    normalized = {}
+    required = (
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+    )
+    for key in required:
+        value = usage.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        normalized[key] = value
+
+    cache_write = usage.get("cache_write_input_tokens")
+    if (
+        isinstance(cache_write, int)
+        and not isinstance(cache_write, bool)
+        and cache_write >= 0
+    ):
+        normalized["cache_write_input_tokens"] = cache_write
+    normalized["total_tokens"] = (
+        normalized["input_tokens"] + normalized["output_tokens"]
+    )
+    return normalized
+
+
+def _bounded_string(value, limit=100):
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    return value[:limit]
+
+
+def _quota_window(value):
+    if not isinstance(value, dict):
+        return None
+    used_percent = value.get("usedPercent")
+    if isinstance(used_percent, bool) or not isinstance(used_percent, int):
+        return None
+    result = {"used_percent": used_percent}
+    for source, target in (
+        ("windowDurationMins", "window_duration_minutes"),
+        ("resetsAt", "resets_at"),
+    ):
+        item = value.get(source)
+        if isinstance(item, int) and not isinstance(item, bool):
+            result[target] = item
+    return result
+
+
+def _quota_bucket(value):
+    if not isinstance(value, dict):
+        return None
+    result = {
+        "limit_id": _bounded_string(value.get("limitId")),
+        "limit_name": _bounded_string(value.get("limitName")),
+        "plan_type": _bounded_string(value.get("planType")),
+        "primary": _quota_window(value.get("primary")),
+        "secondary": _quota_window(value.get("secondary")),
+        "rate_limit_reached_type": _bounded_string(value.get("rateLimitReachedType")),
+    }
+    spend_control_reached = value.get("spendControlReached")
+    if isinstance(spend_control_reached, bool):
+        result["spend_control_reached"] = spend_control_reached
+
+    credits = value.get("credits")
+    if isinstance(credits, dict):
+        safe_credits = {}
+        for source, target in (
+            ("hasCredits", "has_credits"),
+            ("unlimited", "unlimited"),
+        ):
+            item = credits.get(source)
+            if isinstance(item, bool):
+                safe_credits[target] = item
+        balance = _bounded_string(credits.get("balance"), limit=40)
+        if balance is not None:
+            safe_credits["balance"] = balance
+        if safe_credits:
+            result["credits"] = safe_credits
+    return result
+
+
+def _sanitize_rate_limits(result):
+    if not isinstance(result, dict):
+        raise RuntimeError("invalid quota response")
+
+    buckets = {}
+    source_buckets = result.get("rateLimitsByLimitId")
+    if isinstance(source_buckets, dict):
+        for key, value in list(source_buckets.items())[:MAX_QUOTA_BUCKETS]:
+            safe_key = _bounded_string(key)
+            safe_bucket = _quota_bucket(value)
+            if safe_key and safe_bucket is not None:
+                buckets[safe_key] = safe_bucket
+
+    if not buckets:
+        fallback = _quota_bucket(result.get("rateLimits"))
+        if fallback is None:
+            raise RuntimeError("quota response had no rate-limit buckets")
+        fallback_key = fallback.get("limit_id") or "default"
+        buckets[fallback_key] = fallback
+
+    sanitized = {"buckets": buckets}
+    reset_credits = result.get("rateLimitResetCredits")
+    if isinstance(reset_credits, dict):
+        available = reset_credits.get("availableCount")
+        if (
+            isinstance(available, int)
+            and not isinstance(available, bool)
+            and available >= 0
+        ):
+            sanitized["rate_limit_reset_credits_available"] = available
+    return sanitized
+
+
+def _write_rpc_message(proc, message):
+    payload = json.dumps(message, ensure_ascii=True, separators=(",", ":"))
+    proc.stdin.write(payload.encode("utf-8") + b"\n")
+    proc.stdin.flush()
+
+
+def _read_rpc_response(proc, request_id, deadline, buffered=b""):
+    while True:
+        while b"\n" in buffered:
+            raw_line, buffered = buffered.split(b"\n", 1)
+            if not raw_line.strip():
+                continue
+            try:
+                message = json.loads(raw_line.decode("utf-8", errors="replace"))
+            except (TypeError, ValueError):
+                continue
+            if isinstance(message, dict) and message.get("id") == request_id:
+                return message, buffered
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("quota request timed out")
+        readable, _, _ = select.select([proc.stdout], [], [], remaining)
+        if not readable:
+            raise TimeoutError("quota request timed out")
+        chunk = os.read(proc.stdout.fileno(), 65536)
+        if not chunk:
+            raise RuntimeError("app-server closed before responding")
+        buffered += chunk
+        if len(buffered) > MAX_RPC_BUFFER_BYTES:
+            raise RuntimeError("app-server response exceeded safety limit")
+
+
+def _stop_app_server(proc):
+    if proc is None:
+        return
+    try:
+        if proc.stdin:
+            proc.stdin.close()
+    except OSError:
+        pass
+    if proc.poll() is not None:
+        return
+    _terminate_process_group(proc.pid)
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc.pid)
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _read_quota_snapshot(codex_binary, env, cwd, timeout_seconds=QUOTA_TIMEOUT_SECONDS):
+    """Read ChatGPT quota metadata through the documented app-server API."""
+    proc = None
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    try:
+        proc = subprocess.Popen(
+            [codex_binary, "app-server", "--listen", "stdio://"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            cwd=cwd,
+            start_new_session=True,
+        )
+        _write_rpc_message(
+            proc,
+            {
+                "method": "initialize",
+                "id": 1,
+                "params": {
+                    "clientInfo": {
+                        "name": "limnoria_codex",
+                        "title": "Limnoria Codex Plugin",
+                        "version": "1.0.0",
+                    }
+                },
+            },
+        )
+        response, buffered = _read_rpc_response(proc, 1, deadline)
+        if response.get("error") or not isinstance(response.get("result"), dict):
+            raise RuntimeError("app-server initialization failed")
+
+        _write_rpc_message(proc, {"method": "initialized", "params": {}})
+        _write_rpc_message(proc, {"method": "account/rateLimits/read", "id": 2})
+        response, _ = _read_rpc_response(proc, 2, deadline, buffered)
+        if response.get("error") or not isinstance(response.get("result"), dict):
+            raise RuntimeError("quota request failed")
+        return {
+            "status": "available",
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+            **_sanitize_rate_limits(response["result"]),
+        }
+    except TimeoutError:
+        return {
+            "status": "unavailable",
+            "error": "timeout",
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+        }
+    except Exception:
+        return {
+            "status": "unavailable",
+            "error": "request_failed",
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+        }
+    finally:
+        _stop_app_server(proc)
+
+
+def _append_usage_record(layout, record):
+    output_dir = layout.get("output") if isinstance(layout, dict) else ""
+    if not output_dir:
+        return False
+    path = os.path.join(output_dir, USAGE_LOG_FILENAME)
+    line = json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n"
+    try:
+        try:
+            if os.path.getsize(path) >= USAGE_LOG_MAX_BYTES:
+                os.replace(path, path + ".1")
+        except FileNotFoundError:
+            pass
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
+        return True
+    except OSError:
+        return False
 
 
 def _debug_env_summary(env):
@@ -539,25 +845,35 @@ def _resolve_write_layout():
     raise RuntimeError(f"runtime write-path preflight failed: {detail}")
 
 
-def _resolve_deep_log_dir(configured):
+def _resolve_soju_transport_config(configured):
     if not configured:
-        raise RuntimeError("deep mode requires --log-dir")
+        raise RuntimeError("deep mode requires --soju-transport-config")
     resolved = os.path.realpath(os.path.abspath(os.path.expanduser(configured)))
-    if not os.path.isdir(resolved) or not os.access(resolved, os.R_OK | os.X_OK):
-        raise RuntimeError("deep log directory is not readable")
-    if not os.path.isfile(DEEP_TOOLS_PATH):
-        raise RuntimeError("deep log tools are unavailable")
+    if (
+        os.path.islink(configured)
+        or not os.path.isfile(resolved)
+        or not os.access(resolved, os.R_OK)
+    ):
+        raise RuntimeError("canonical history transport configuration is not readable")
+    if not os.path.isfile(SOJU_TOOLS_PATH):
+        raise RuntimeError("canonical history tools are unavailable")
     return resolved
 
 
-def _resolve_deep_log_cutoff(configured):
+def _resolve_soju_cutoff(configured):
     if not configured:
-        return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+        raise RuntimeError("deep mode requires --soju-cutoff")
+    value = str(configured).strip()
+    candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
     try:
-        datetime.strptime(configured, "%Y-%m-%dT%H:%M:%S")
+        parsed = datetime.fromisoformat(candidate)
     except (TypeError, ValueError) as exc:
-        raise RuntimeError("deep log cutoff is invalid") from exc
-    return configured
+        raise RuntimeError("canonical history cutoff is malformed") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        raise RuntimeError("canonical history cutoff must be UTC")
+    return parsed.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z"
+    )
 
 
 def main():
@@ -592,14 +908,14 @@ def main():
         help="Optional web search context size override for the selected mode.",
     )
     parser.add_argument(
-        "--log-dir",
+        "--soju-transport-config",
         default=None,
-        help="Prevalidated current-channel log directory; required only in deep mode.",
+        help="Prevalidated private transport configuration; required only in deep mode.",
     )
     parser.add_argument(
-        "--log-cutoff",
+        "--soju-cutoff",
         default=None,
-        help="Optional local timestamp immediately before the request; defaults to now in deep mode.",
+        help="Trusted exclusive UTC history cutoff; required only in deep mode.",
     )
     args = parser.parse_args()
 
@@ -611,17 +927,22 @@ def main():
     )
     if args.mode == MODE_DEEP:
         try:
-            deep_log_dir = _resolve_deep_log_dir(args.log_dir)
-            deep_log_cutoff = _resolve_deep_log_cutoff(args.log_cutoff)
+            soju_transport_config = _resolve_soju_transport_config(
+                args.soju_transport_config
+            )
+            soju_cutoff = _resolve_soju_cutoff(args.soju_cutoff)
         except RuntimeError as exc:
             print(str(exc)[:300], file=sys.stderr)
             return 125
     else:
-        if args.log_dir or args.log_cutoff:
-            print("--log-dir and --log-cutoff are valid only in deep mode", file=sys.stderr)
+        if args.soju_transport_config or args.soju_cutoff:
+            print(
+                "--soju-transport-config and --soju-cutoff are valid only in deep mode",
+                file=sys.stderr,
+            )
             return 2
-        deep_log_dir = None
-        deep_log_cutoff = None
+        soju_transport_config = None
+        soju_cutoff = None
     prompt_text = sys.stdin.read()
     if not prompt_text.strip():
         print("empty prompt", file=sys.stderr)
@@ -640,6 +961,13 @@ def main():
         return 127
 
     output_path = ""
+    telemetry_started = None
+    telemetry_started_at = None
+    telemetry_stdout = ""
+    telemetry_status = "not_started"
+    telemetry_exit_code = None
+    telemetry_request_id = uuid.uuid4().hex
+    child_env = None
     try:
         with tempfile.NamedTemporaryFile(
             prefix="codex-last-message-",
@@ -656,8 +984,9 @@ def main():
                 codex_binary,
                 layout,
                 code_home=exec_code_home,
-                deep_log_dir=deep_log_dir,
-                deep_log_cutoff=deep_log_cutoff,
+                soju_transport_config=soju_transport_config,
+                soju_cutoff=soju_cutoff,
+                soju_request_id=telemetry_request_id,
             )
             _append_debug_line(
                 layout,
@@ -672,6 +1001,11 @@ def main():
                     f"env={_debug_env_summary(child_env)}"
                 ),
             )
+            telemetry_started = time.monotonic()
+            telemetry_started_at = time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+            )
+            telemetry_status = "running"
             proc = _run_with_timeout(
                 cmd,
                 prompt_text,
@@ -680,18 +1014,25 @@ def main():
                 cwd=layout["agent_cwd"],
                 temp_dir=layout["temp"],
             )
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
+            telemetry_stdout = exc.stdout or ""
+            telemetry_status = "timeout"
             _append_debug_line(layout, f"timeout seconds={timeout_seconds}")
             print(f"codex timed out after {timeout_seconds}s", file=sys.stderr)
             return 124
         except FileNotFoundError:
+            telemetry_status = "launch_error"
             print("codex binary not found", file=sys.stderr)
             return 127
         except OSError as exc:
+            telemetry_status = "launch_error"
             print(f"failed to launch codex: {exc}", file=sys.stderr)
             return 126
 
+        telemetry_stdout = proc.stdout or ""
+        telemetry_exit_code = proc.returncode
         if proc.returncode != 0:
+            telemetry_status = "codex_error"
             raw_detail = (proc.stderr or proc.stdout or "").strip()
             structured_detail = _structured_error_detail(proc.stdout)
             detail = structured_detail or raw_detail
@@ -708,6 +1049,7 @@ def main():
             except RuntimeError:
                 last_message = ""
             if last_message and _has_non_fatal_rollout_error(detail):
+                telemetry_status = "recovered_rollout_error"
                 sys.stdout.write(last_message)
                 if not last_message.endswith("\n"):
                     sys.stdout.write("\n")
@@ -722,18 +1064,51 @@ def main():
         try:
             last_message = _read_last_message(output_path)
         except RuntimeError as exc:
+            telemetry_status = "output_error"
             print(str(exc), file=sys.stderr)
             return 125
 
         if not last_message:
+            telemetry_status = "empty_response"
             print("codex returned an empty final message", file=sys.stderr)
             return 3
 
+        telemetry_status = "success"
         sys.stdout.write(last_message)
         if not last_message.endswith("\n"):
             sys.stdout.write("\n")
         return 0
     finally:
+        if telemetry_started is not None and child_env is not None:
+            duration_ms = int((time.monotonic() - telemetry_started) * 1000)
+            quota_env = dict(child_env)
+            quota_env.pop(SOJU_TRANSPORT_CONFIG_ENV, None)
+            quota_env.pop(SOJU_CUTOFF_ENV, None)
+            quota_env.pop(SOJU_TELEMETRY_PATH_ENV, None)
+            quota_env.pop(SOJU_REQUEST_ID_ENV, None)
+            try:
+                quota = _read_quota_snapshot(
+                    codex_binary,
+                    quota_env,
+                    layout["agent_cwd"],
+                )
+            except Exception:
+                quota = {"status": "unavailable", "error": "internal_error"}
+            record = {
+                "schema_version": 1,
+                "request_id": telemetry_request_id,
+                "started_at": telemetry_started_at,
+                "mode": args.mode,
+                "model": settings["model"],
+                "reasoning_effort": settings["reasoning_effort"],
+                "status": telemetry_status,
+                "duration_ms": duration_ms,
+                "exit_code": telemetry_exit_code,
+                "tokens": _turn_usage(telemetry_stdout),
+                "quota": quota,
+            }
+            if not _append_usage_record(layout, record):
+                _append_debug_line(layout, "usage telemetry write failed")
         if output_path:
             try:
                 os.unlink(output_path)

@@ -32,15 +32,6 @@ conf.registerGlobalValue(
 
 conf.registerGlobalValue(
     Codex,
-    "deepLogRoot",
-    registry.String(
-        "",
-        """ChannelLogger root containing network/channel directories. Empty uses the Limnoria log directory.""",
-    ),
-)
-
-conf.registerGlobalValue(
-    Codex,
     "maxContextLines",
     registry.PositiveInteger(
         20,
