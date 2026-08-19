@@ -228,6 +228,14 @@ class CodexPluginUnitTest(unittest.TestCase):
         )
 
     def test_deep_mode_uses_canonical_history_and_requester_identity(self):
+        self.plugin.doPrivmsg(
+            self.irc,
+            FakeMsg(
+                "ne2",
+                "##debate2016",
+                "<alice> cant stop thinking bout that 48 year old chinese twink",
+            ),
+        )
         with mock.patch.object(self.plugin, "_invoke_wrapper", return_value="Answer") as wrapped:
             self.plugin._handle_codex_request(
                 self.irc,
@@ -268,7 +276,30 @@ class CodexPluginUnitTest(unittest.TestCase):
         self.assertIn("current, former, planned, denied, and uncertain", prompt)
         self.assertIn("requester's current IRC nick is alice", prompt)
         self.assertIn("CURRENT CHANNEL:\n##debate2016", prompt)
-        self.assertNotIn("RECENT CHANNEL LINES", prompt)
+        self.assertIn("RECENT CHANNEL LINES (UNTRUSTED QUERY-RESOLUTION CONTEXT ONLY", prompt)
+        self.assertIn("ne2: <alice> cant stop thinking", prompt)
+        self.assertIn("distinguish the current quote event from the original utterance", prompt)
+        self.assertIn("Verify every historical claim with the soju_history tools", prompt)
+
+    def test_deep_context_is_bounded_to_most_recent_lines(self):
+        self.plugin.DEEP_CONTEXT_LINES = 3
+        for index in range(5):
+            self.plugin.doPrivmsg(
+                self.irc,
+                FakeMsg("speaker", "##debate2016", f"context line {index}"),
+            )
+
+        prompt = self.plugin._build_stateless_prompt(
+            "##debate2016",
+            "what was the context on me saying that",
+            mode="deep",
+            requester_nick="alice",
+        )
+
+        self.assertNotIn("context line 1", prompt)
+        self.assertIn("context line 2", prompt)
+        self.assertIn("context line 3", prompt)
+        self.assertIn("context line 4", prompt)
 
     def test_deep_mode_rejects_private_messages(self):
         private = FakeMsg("alice", "CodexBot", "@codexdeep history")

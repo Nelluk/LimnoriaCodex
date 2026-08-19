@@ -105,7 +105,7 @@ Owner-only memory commands:
 Behavior summary:
 
 - Each request is stateless.
-- Recent channel or private-message context is included as untrusted context.
+- Recent channel or private-message context is included as untrusted context. Deep mode includes only the 25 most recent channel lines and uses them solely to resolve query ambiguity; canonical-history tools must verify historical claims.
 - `@terra`/`@terrahigh` and `@luna`/`@lunahigh` expose medium- and high-reasoning model primitives.
 - `@terrano` and `@lunano` use their model's higher-effort preset without including channel context or prior Codex memory in the prompt.
 - `@codexlong` uses a larger in-memory transcript buffer for channel analysis, with local hour markers and per-line times.
@@ -140,7 +140,7 @@ Operational defaults in `plugin.py`:
 - `@terrano` and `@lunano` use the matching model's high reasoning and web search settings.
 - `@codexlong` context size: 1000 captured lines.
 - `@codexlong` context time format: hourly local markers plus `[HH:MM]` line prefixes.
-- `@codexdeep` supplies the invoking nick so “I” and “me” can be resolved in historical questions.
+- `@codexdeep` supplies the invoking nick and a 25-line query-resolution context block so pronouns, nearby quotations, and references such as “that” can be resolved in historical questions.
 - Captured IRC line cap: 200 chars per line.
 - Reply cap: 1200 chars total.
 - Memory age cap: 72 hours.
