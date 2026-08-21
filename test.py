@@ -75,6 +75,7 @@ class DummyCodex(Codex):
             "timeoutSeconds": 90,
             "deepTimeoutSeconds": 180,
             "maxContextLines": 20,
+            "knownBotNicks": ["HenryClay", "ne2", "ne2`"],
             "persistentMemoryEnabled": False,
             "memoryMaxExchanges": 8,
             "cooldownSeconds": 0,
@@ -244,7 +245,13 @@ class CodexPluginUnitTest(unittest.TestCase):
                 mode="deep",
             )
 
-        self.assertEqual(self.irc.replies, ["Answer"])
+        self.assertEqual(
+            self.irc.replies,
+            [
+                "alice: Searching debate2016 history for “What did I argue about?”…",
+                "Answer",
+            ],
+        )
         self.assertEqual(wrapped.call_args.args[2], 180)
         self.assertEqual(wrapped.call_args.kwargs["mode"], "deep")
         self.assertEqual(
@@ -267,7 +274,11 @@ class CodexPluginUnitTest(unittest.TestCase):
         self.assertIn("Never issue generic or common-word full-text searches", prompt)
         self.assertIn("use context for bounded chronological expansion", prompt)
         self.assertIn("pass explicit from_time and until_time", prompt)
-        self.assertIn("Never infer that a sender is a bot", prompt)
+        self.assertIn("deployment-confirmed bot nicks are: HenryClay, ne2, ne2`", prompt)
+        self.assertIn("questions ranking or describing people", prompt)
+        self.assertIn("exclude every deployment-confirmed bot nick", prompt)
+        self.assertIn("do not select those bots for speaker_history", prompt)
+        self.assertIn("query explicitly names it", prompt)
         self.assertIn("matching_messages counts messages", prompt)
         self.assertIn("groups_total counts distinct groups", prompt)
         self.assertIn("effective_to_time", prompt)
@@ -280,6 +291,37 @@ class CodexPluginUnitTest(unittest.TestCase):
         self.assertIn("ne2: <alice> cant stop thinking", prompt)
         self.assertIn("distinguish the current quote event from the original utterance", prompt)
         self.assertIn("Verify every historical claim with the soju_history tools", prompt)
+
+    def test_deep_progress_reply_is_sanitized_and_bounded(self):
+        query = "topic\x02 with\nspacing " + ("x" * 200)
+        reply = self.plugin._deep_progress_reply(query, "alice\x02")
+
+        self.assertTrue(reply.startswith("alice: Searching debate2016 history for “topic with spacing "))
+        self.assertTrue(reply.endswith("”…"))
+        self.assertNotIn("\n", reply)
+        quoted_query = reply.split("“", 1)[1].rsplit("”", 1)[0]
+        self.assertLessEqual(len(quoted_query), self.plugin.DEEP_PROGRESS_QUERY_CHARS)
+
+    def test_deep_progress_precedes_timeout_reply(self):
+        with mock.patch.object(
+            self.plugin,
+            "_invoke_wrapper",
+            side_effect=WrapperTimeoutError("timed out"),
+        ):
+            self.plugin._handle_codex_request(
+                self.irc,
+                self.deep_msg,
+                "slow historical question",
+                mode="deep",
+            )
+
+        self.assertEqual(
+            self.irc.replies,
+            [
+                "alice: Searching debate2016 history for “slow historical question”…",
+                "Codex timed out. Please try a shorter request.",
+            ],
+        )
 
     def test_deep_context_is_bounded_to_most_recent_lines(self):
         self.plugin.DEEP_CONTEXT_LINES = 3
@@ -300,6 +342,20 @@ class CodexPluginUnitTest(unittest.TestCase):
         self.assertIn("context line 2", prompt)
         self.assertIn("context line 3", prompt)
         self.assertIn("context line 4", prompt)
+
+    def test_deep_known_bot_nicks_are_sanitized_and_deduplicated(self):
+        self.plugin._config["knownBotNicks"] = [
+            "HenryClay",
+            "henryclay",
+            "ne2\x02",
+            "ne2`",
+            "   ",
+        ]
+
+        self.assertEqual(
+            self.plugin._deep_known_bot_nicks(),
+            ["HenryClay", "ne2", "ne2`"],
+        )
 
     def test_deep_mode_rejects_private_messages(self):
         private = FakeMsg("alice", "CodexBot", "@codexdeep history")

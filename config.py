@@ -41,6 +41,15 @@ conf.registerGlobalValue(
 
 conf.registerGlobalValue(
     Codex,
+    "knownBotNicks",
+    registry.SpaceSeparatedListOfStrings(
+        ["HenryClay", "ne2", "ne2`"],
+        """Trusted bot nicknames excluded by default from human-focused deep-history results.""",
+    ),
+)
+
+conf.registerGlobalValue(
+    Codex,
     "persistentMemoryEnabled",
     registry.Boolean(
         False,

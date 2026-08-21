@@ -110,6 +110,7 @@ Behavior summary:
 - `@terrano` and `@lunano` use their model's higher-effort preset without including channel context or prior Codex memory in the prompt.
 - `@codexlong` uses a larger in-memory transcript buffer for channel analysis, with local hour markers and per-line times.
 - `@codexdeep` searches canonical Soju history for the debate2016 channel lineage and is unavailable in private messages or other channels.
+- Accepted `@codexdeep` requests immediately acknowledge the requester and summarize the bounded debate2016 history search while the substantive answer is generated.
 - Returned history is untrusted evidence. The model receives only `search`, `search_summary`, `history_summary`, `context`, `conversations`, `speaker_history`, and `aggregate`; it cannot choose another network, target, scope, remote command, or local path.
 - `history_summary` provides exact entire-scope totals and boundary messages; `search_summary` provides exact topical totals and chronological edges; `context` expands a message ID; `search` finds individual evidence; `conversations` reconstructs participant-aware exchanges; `speaker_history` samples a speaker timeline; and `aggregate` groups exact counts by sender/day/week/month/year.
 - Deep requests have a 20-call history-tool budget. The prompt directs Codex to plan first, use the operation matching the question, inspect completeness/truncation metadata, combine only explicit aliases, and avoid searching for nonhistorical requests.
@@ -125,6 +126,7 @@ Main Limnoria registry settings:
 - `timeoutSeconds`: max end-to-end runtime for one Codex request.
 - `deepTimeoutSeconds`: max runtime for one `@codexdeep` request; default 180 seconds.
 - `maxContextLines`: recent IRC context lines retained per channel or PM context.
+- `knownBotNicks`: trusted bot nicknames excluded by default from human-focused `@codexdeep` rankings, preferences, counts, and participation results; defaults to `HenryClay`, `ne2`, and “ne2`”.
 - `persistentMemoryEnabled`: enables persisted successful Codex exchange memory.
 - `memoryMaxExchanges`: maximum stored successful Codex exchanges per context.
 - `cooldownSeconds`: per-user rate limit.

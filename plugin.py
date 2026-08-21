@@ -58,6 +58,7 @@ class Codex(callbacks.Plugin):
     HIGH_WEB_SEARCH_CONTEXT_SIZE = "high"
     CONTEXT_LINE_CHARS = 200
     DEEP_CONTEXT_LINES = 25
+    DEEP_PROGRESS_QUERY_CHARS = 160
     LONG_CONTEXT_LINES = 1000
     LONG_CONTEXT_TIME_FORMAT = "%H:%M"
     LONG_CONTEXT_MARKER_FORMAT = "%Y-%m-%d %H:00 local"
@@ -602,6 +603,24 @@ class Codex(callbacks.Plugin):
     def _get_deep_context_lines(self, channel):
         return self._get_context_lines(channel)[-self.DEEP_CONTEXT_LINES :]
 
+    def _deep_known_bot_nicks(self):
+        nicks = []
+        seen = set()
+        for value in self.registryValue("knownBotNicks") or []:
+            nick = self._sanitize_context_text(value)
+            folded = nick.casefold()
+            if nick and folded not in seen:
+                seen.add(folded)
+                nicks.append(nick)
+        return nicks
+
+    def _deep_progress_reply(self, query, requester_nick):
+        requester = self._sanitize_context_text(requester_nick or "") or "user"
+        summary = self._truncate(
+            self._sanitize_context_text(query), self.DEEP_PROGRESS_QUERY_CHARS
+        )
+        return f"{requester}: Searching debate2016 history for “{summary}”…"
+
     def _get_long_context_lines(self, channel):
         buffered = list(self._long_context_buffers.get(channel, ()))
         if len(buffered) > self.LONG_CONTEXT_LINES:
@@ -642,6 +661,8 @@ class Codex(callbacks.Plugin):
         mode = self._normalized_mode(mode)
         if mode == MODE_DEEP:
             requester = self._sanitize_context_text(requester_nick or "") or "unknown"
+            known_bot_nicks = self._deep_known_bot_nicks()
+            known_bots = ", ".join(known_bot_nicks) or "(none configured)"
             context_lines = self._get_deep_context_lines(channel)
             context_block = (
                 "\n".join(context_lines)
@@ -674,7 +695,9 @@ class Codex(callbacks.Plugin):
                     "Use conversations for participant-aware discussion fragments; check its metadata for candidate limits and scan completeness.",
                     "Use speaker_history for representative evidence across a person's timeline; combine aliases only when the query or visible evidence reliably establishes identity, and disclose the combination.",
                     "For a question limited to a year, month, or other period, pass explicit from_time and until_time bounds instead of searching all history and filtering mentally.",
-                    "For human-only counts, use exclude_senders only for explicitly requested or confirmed bot nicks and disclose every exclusion in the answer. Never infer that a sender is a bot.",
+                    "The deployment-confirmed bot nicks are: " + known_bots + ". Treat only this trusted list or bots explicitly established by the query as bots; never infer additional bots.",
+                    "For questions ranking or describing people, community members, personal preferences, or human participation, exclude every deployment-confirmed bot nick from all supported discovery, search, count, conversation, and aggregate calls, and do not select those bots for speaker_history.",
+                    "Include a confirmed bot only when the query explicitly names it, explicitly asks about bots or automated activity, or its relayed message is necessary evidence for the requested history. Briefly disclose any such material inclusion; routine default exclusions need not be listed in the answer.",
                     "For broad concepts, make a small number of deliberate searches for important spellings, abbreviations, generic names, or product names rather than assuming one literal query is exhaustive.",
                     "For current or historical status claims, distinguish current, former, planned, denied, and uncertain status using dated first-person evidence; phrase present status as 'last known from the history' unless recent evidence proves it.",
                     "You have at most 20 history tool calls. Synthesize before the budget is exhausted.",
@@ -1186,6 +1209,11 @@ class Codex(callbacks.Plugin):
         wrapper_mode = self._wrapper_mode_for_request_mode(mode)
 
         try:
+            if mode == MODE_DEEP:
+                irc.reply(
+                    self._deep_progress_reply(query, msg.nick),
+                    prefixNick=False,
+                )
             output = self._invoke_wrapper(
                 wrapper_path,
                 full_prompt,
