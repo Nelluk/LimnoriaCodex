@@ -5,6 +5,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import select
 import signal
 import shutil
@@ -25,14 +26,16 @@ OUTPUT_DIR_ENV = "CODEX_WRAPPER_OUTPUT_DIR"
 TEMP_DIR_ENV = "CODEX_WRAPPER_TEMP_DIR"
 CANDIDATES_ENV = "CODEX_WRAPPER_CANDIDATES"
 EXEC_CODEX_HOME_ENV = "CODEX_WRAPPER_EXEC_CODEX_HOME"
-MODE_TERRA = "terra"
-MODE_TERRA_HIGH = "terrahigh"
-MODE_LUNA = "luna"
-MODE_LUNA_HIGH = "lunahigh"
+MODE_ASK = "ask"
 MODE_DEEP = "deep"
-ALLOWED_MODES = (MODE_TERRA, MODE_TERRA_HIGH, MODE_LUNA, MODE_LUNA_HIGH, MODE_DEEP)
+ALLOWED_MODES = (MODE_ASK, MODE_DEEP)
+DEFAULT_MODEL = "gpt-6-luna"
+DEFAULT_REASONING_EFFORT = "high"
 ALLOWED_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 ALLOWED_WEB_SEARCH_CONTEXT_SIZES = ("low", "medium", "high")
+ALLOWED_CONTEXT_POLICIES = ("none", "recent", "long", "deep")
+MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,95}$")
+MODEL_FAMILY_SPLIT_RE = re.compile(r"[-/.]+")
 NON_FATAL_ROLLOUT_ERROR = "failed to record rollout items:"
 USAGE_LOG_FILENAME = "usage-telemetry.jsonl"
 USAGE_LOG_MAX_BYTES = 5_000_000
@@ -52,32 +55,14 @@ EXEC_DISABLED_FEATURES = (
     "skill_mcp_dependency_install",
 )
 MODE_PRESETS = {
-    MODE_TERRA: {
-        "model": "gpt-5.6-terra",
-        "reasoning_effort": "medium",
+    MODE_ASK: {
+        "model": DEFAULT_MODEL,
+        "reasoning_effort": DEFAULT_REASONING_EFFORT,
         "web_search": "live",
         "web_search_context_size": None,
-    },
-    MODE_TERRA_HIGH: {
-        "model": "gpt-5.6-terra",
-        "reasoning_effort": "high",
-        "web_search": "live",
-        "web_search_context_size": "high",
-    },
-    MODE_LUNA: {
-        "model": "gpt-5.6-luna",
-        "reasoning_effort": "medium",
-        "web_search": "live",
-        "web_search_context_size": None,
-    },
-    MODE_LUNA_HIGH: {
-        "model": "gpt-5.6-luna",
-        "reasoning_effort": "high",
-        "web_search": "live",
-        "web_search_context_size": "high",
     },
     MODE_DEEP: {
-        "model": "gpt-5.6-luna",
+        "model": DEFAULT_MODEL,
         "reasoning_effort": "high",
         "web_search": "disabled",
         "web_search_context_size": None,
@@ -127,15 +112,62 @@ def _resolve_timeout(cli_timeout):
         return DEFAULT_TIMEOUT_SECONDS
 
 
-def _runtime_settings(mode, reasoning_effort=None, web_search_context_size=None):
-    normalized_mode = str(mode or MODE_TERRA).strip().lower()
+def _model_has_family(model, family):
+    parts = MODEL_FAMILY_SPLIT_RE.split(str(model).casefold())
+    return family.casefold() in parts
+
+
+def _normalize_reasoning_effort(value):
+    effort = str(value).strip().casefold()
+    if effort == "x-high":
+        effort = "xhigh"
+    if effort not in ALLOWED_REASONING_EFFORTS:
+        raise RuntimeError("unsupported reasoning effort")
+    return effort
+
+
+def _reasoning_effort_arg(value):
+    try:
+        return _normalize_reasoning_effort(value)
+    except RuntimeError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _runtime_settings(
+    mode,
+    model=None,
+    reasoning_effort=None,
+    web_search_context_size=None,
+):
+    normalized_mode = str(mode or MODE_ASK).strip().lower()
     if normalized_mode not in ALLOWED_MODES:
         raise RuntimeError(f"unsupported mode: {mode}")
 
     preset = dict(MODE_PRESETS[normalized_mode])
+    if normalized_mode == MODE_DEEP:
+        if model is not None or reasoning_effort is not None or web_search_context_size is not None:
+            raise RuntimeError("deep mode does not accept model or search overrides")
+        return preset
+
+    if model is not None:
+        candidate = str(model).strip()
+        if not MODEL_ID_RE.fullmatch(candidate):
+            raise RuntimeError("model must be a model identifier without spaces")
+        if _model_has_family(candidate, "astra"):
+            raise RuntimeError("Astra models are unavailable")
+        preset["model"] = candidate
+    if _model_has_family(preset["model"], "astra"):
+        raise RuntimeError("Astra models are unavailable")
     if reasoning_effort is not None:
-        preset["reasoning_effort"] = reasoning_effort
+        preset["reasoning_effort"] = _normalize_reasoning_effort(reasoning_effort)
+    if (
+        preset["reasoning_effort"] == "max"
+        and not _model_has_family(preset["model"], "luna")
+    ):
+        raise RuntimeError("max effort is available only with a Luna model")
     if web_search_context_size is not None:
+        if web_search_context_size not in ALLOWED_WEB_SEARCH_CONTEXT_SIZES:
+            raise RuntimeError("unsupported web search context size")
         preset["web_search_context_size"] = web_search_context_size
     return preset
 
@@ -892,14 +924,25 @@ def main():
     parser.add_argument(
         "--mode",
         choices=ALLOWED_MODES,
-        default=MODE_TERRA,
-        help="Execution preset to use for the Codex request.",
+        default=MODE_ASK,
+        help="Request path; deep is reserved for fixed-scope canonical history.",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Codex model identifier for ask mode.",
     )
     parser.add_argument(
         "--reasoning-effort",
-        choices=ALLOWED_REASONING_EFFORTS,
+        type=_reasoning_effort_arg,
         default=None,
-        help="Optional reasoning effort override for the selected mode.",
+        help="Reasoning effort for ask mode.",
+    )
+    parser.add_argument(
+        "--context-policy",
+        choices=ALLOWED_CONTEXT_POLICIES,
+        default="recent",
+        help="IRC context policy recorded for this request.",
     )
     parser.add_argument(
         "--web-search-context-size",
@@ -920,11 +963,19 @@ def main():
     args = parser.parse_args()
 
     timeout_seconds = _resolve_timeout(args.timeout)
-    settings = _runtime_settings(
-        args.mode,
-        reasoning_effort=args.reasoning_effort,
-        web_search_context_size=args.web_search_context_size,
-    )
+    if (args.mode == MODE_DEEP) != (args.context_policy == "deep"):
+        print("deep mode requires --context-policy deep; ask mode cannot use it", file=sys.stderr)
+        return 2
+    try:
+        settings = _runtime_settings(
+            args.mode,
+            model=args.model,
+            reasoning_effort=args.reasoning_effort,
+            web_search_context_size=args.web_search_context_size,
+        )
+    except RuntimeError as exc:
+        print(str(exc)[:300], file=sys.stderr)
+        return 2
     if args.mode == MODE_DEEP:
         try:
             soju_transport_config = _resolve_soju_transport_config(
@@ -1101,6 +1152,8 @@ def main():
                 "mode": args.mode,
                 "model": settings["model"],
                 "reasoning_effort": settings["reasoning_effort"],
+                "context_policy": args.context_policy,
+                "web_search_context_size": settings.get("web_search_context_size"),
                 "status": telemetry_status,
                 "duration_ms": duration_ms,
                 "exit_code": telemetry_exit_code,

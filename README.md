@@ -85,15 +85,20 @@ Deep mode adds only its fixed-scope, read-only canonical-history tools.
 ## Commands
 
 ```irc
-@terra <prompt>
-@terrahigh <prompt>
-@terrano <prompt>
-@luna <prompt>
-@lunahigh <prompt>
-@lunano <prompt>
-@codexlong <prompt>
+@codexask [--model=<id>] [--effort=none|low|medium|high|xhigh|x-high|max] [--context=none|recent|long] [--search-context=low|medium|high] -- <prompt>
 @codexdeep <prompt>
 ```
+
+`@codexask` defaults to `gpt-6-luna`, `high` reasoning effort, recent IRC and
+Codex exchange context, and the default live web-search context. Options must
+precede `--`; the delimiter lets prompts safely begin with `--`. The context
+policy selects `none` (no IRC or prior Codex context), `recent` (recent chat and
+memory), or `long` (the captured transcript for analysis). Search context is a
+separate optional web-search setting. The effort spelling `x-high` aliases to
+`xhigh`; `ultra` is unsupported, and `max` requires a model identifier with a
+`luna` family component. Astra models such as `gpt-6-astra` are unavailable.
+The former `@luna`, `@lunahigh`, `@lunano`, and `@codexlong` commands are no
+longer built in; define aliases as needed with Limnoria's Aka plugin.
 
 Owner-only memory commands:
 
@@ -105,16 +110,15 @@ Owner-only memory commands:
 Behavior summary:
 
 - Each request is stateless.
-- Recent channel or private-message context is included as untrusted context. Deep mode includes only the 25 most recent channel lines and uses them solely to resolve query ambiguity; canonical-history tools must verify historical claims.
-- `@terra`/`@terrahigh` and `@luna`/`@lunahigh` expose medium- and high-reasoning model primitives.
-- `@terrano` and `@lunano` use their model's higher-effort preset without including channel context or prior Codex memory in the prompt.
-- `@codexlong` uses a larger in-memory transcript buffer for channel analysis, with local hour markers and per-line times.
+- `@codexask` selects model, reasoning effort, and context policy independently. Recent chat and Codex memory are included only for `recent` and `long`, as untrusted context.
+- `@codexask --context=long` uses a larger in-memory transcript buffer for channel analysis, with local hour markers and per-line times.
+- `@codexdeep` includes only the 25 most recent channel lines to resolve query ambiguity; canonical-history tools must verify historical claims.
 - `@codexdeep` searches canonical Soju history for the debate2016 channel lineage and is unavailable in private messages or other channels.
 - Accepted `@codexdeep` requests immediately acknowledge the requester and summarize the bounded debate2016 history search while the substantive answer is generated.
 - Returned history is untrusted evidence. The model receives only `search`, `search_summary`, `history_summary`, `context`, `conversations`, `speaker_history`, and `aggregate`; it cannot choose another network, target, scope, remote command, or local path.
 - `history_summary` provides exact entire-scope totals and boundary messages; `search_summary` provides exact topical totals and chronological edges; `context` expands a message ID; `search` finds individual evidence; `conversations` reconstructs participant-aware exchanges; `speaker_history` samples a speaker timeline; and `aggregate` groups exact counts by sender/day/week/month/year.
 - Deep requests have a 20-call history-tool budget. The prompt directs Codex to plan first, use the operation matching the question, inspect completeness/truncation metadata, combine only explicit aliases, and avoid searching for nonhistorical requests.
-- The native `codex`, `codexhigh`, and `codexno` names are intentionally free for Aka aliases.
+- Model alias names such as `luna` and `lunahigh` are intentionally free for Aka aliases.
 - Optional persistent memory stores timestamped successful Codex command query/reply pairs per context.
 - Output is sanitized for IRC by stripping markdown, links, control characters, and excess formatting.
 - Only one Codex request runs at a time; concurrent requests are rejected as busy.
@@ -136,12 +140,9 @@ Operational defaults in `plugin.py`:
 
 - Canonical wrapper script: `scripts/codex_wrapper.py`
 - Wrapper runtime base: Limnoria data directory for this plugin.
-- `@terrahigh` and `@lunahigh` reasoning effort: `high`
-- `@terrahigh` and `@lunahigh` web search context size: `high`
-- `@luna` and `@lunahigh` use the experimental `gpt-5.6-luna` model.
-- `@terrano` and `@lunano` use the matching model's high reasoning and web search settings.
-- `@codexlong` context size: 1000 captured lines.
-- `@codexlong` context time format: hourly local markers plus `[HH:MM]` line prefixes.
+- `@codexask` defaults: model `gpt-6-luna`, effort `high`, context `recent`.
+- `@codexask --search-context=...` sets hosted web-search context size; omit it to use the Codex CLI default. Deep mode disables web search.
+- `@codexask --context=long` captures up to 1000 lines, with hourly local markers plus `[HH:MM]` line prefixes.
 - `@codexdeep` supplies the invoking nick and a 25-line query-resolution context block so pronouns, nearby quotations, and references such as “that” can be resolved in historical questions.
 - Captured IRC line cap: 200 chars per line.
 - Reply cap: 1200 chars total.
@@ -152,7 +153,7 @@ Operational defaults in `plugin.py`:
 Codex runtime defaults in `scripts/codex_wrapper.py`:
 
 - Backend: hardened `codex exec`.
-- Default model: `gpt-5.6-terra`; Luna model: `gpt-5.6-luna`.
+- Default model: `gpt-6-luna`; `@codexask --model=<id>` overrides it.
 - `model_reasoning_summary = "none"`
 - `model_verbosity = "low"`
 - Hosted web search enabled through `web_search = "live"` except in deep mode.
@@ -163,14 +164,8 @@ Codex runtime defaults in `scripts/codex_wrapper.py`:
 
 Mode-specific defaults:
 
-- `@terra`: `gpt-5.6-terra` with `model_reasoning_effort = "medium"`
-- `@terrahigh`: `gpt-5.6-terra` with `model_reasoning_effort = "high"`
-- `@terrano`: `gpt-5.6-terra` with `model_reasoning_effort = "high"` without prompt context sections.
-- `@luna`: `gpt-5.6-luna` with `model_reasoning_effort = "medium"`
-- `@lunahigh`: `gpt-5.6-luna` with `model_reasoning_effort = "high"`
-- `@lunano`: `gpt-5.6-luna` with `model_reasoning_effort = "high"` without prompt context sections.
-- `@codexlong`: `gpt-5.6-luna` with `model_reasoning_effort = "high"` and transcript-analysis prompt instructions.
-- `@codexdeep`: `gpt-5.6-luna` with `model_reasoning_effort = "high"`, web search disabled, and only the seven canonical Soju history tools enabled.
+- `@codexask`: `gpt-6-luna` with `model_reasoning_effort = "high"`, recent IRC and Codex context, and hosted live web search.
+- `@codexdeep`: `gpt-6-luna` with `model_reasoning_effort = "high"`, web search disabled, and only the seven canonical Soju history tools enabled.
 
 ## Manual Wrapper Test
 
@@ -178,9 +173,9 @@ Default hardened Codex CLI backend using shared `~/.codex` authentication:
 
 ```bash
 printf '%s\n' 'Say hello in one short sentence.' | plugins/Codex/scripts/codex_wrapper.py --timeout 90
-printf '%s\n' 'Verify the latest Fedora release.' | plugins/Codex/scripts/codex_wrapper.py --timeout 90 --mode terrahigh
+printf '%s\n' 'Verify the latest Fedora release.' | plugins/Codex/scripts/codex_wrapper.py --timeout 90 --mode ask --model gpt-6-luna --reasoning-effort xhigh --context-policy recent --web-search-context-size high
 printf '%s\n' 'What did Alice and Bob discuss on election day?' | \
-  plugins/Codex/scripts/codex_wrapper.py --timeout 180 --mode deep \
+  plugins/Codex/scripts/codex_wrapper.py --timeout 180 --mode deep --context-policy deep \
   --soju-transport-config /path/to/private/transport.json \
   --soju-cutoff '<exclusive-UTC-cutoff>'
 ```
@@ -213,8 +208,9 @@ paths.
 The active log rotates at 5 MB, retaining one `usage-telemetry.jsonl.1`
 backup, so telemetry is bounded to roughly 10 MB.
 
-Each record includes the mode, model, reasoning effort, result status, elapsed
-time, and the exact input, cached-input, output, and reasoning-output counters
+Each record includes the request mode, model, reasoning effort, IRC context
+policy, web-search context size, result status, elapsed time, and the exact
+input, cached-input, output, and reasoning-output counters
 reported by `codex exec --json`. After the model process exits, the wrapper also
 uses the documented app-server `account/rateLimits/read` method to record all
 currently returned quota buckets, their integer used percentages, window
