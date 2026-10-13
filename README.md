@@ -114,6 +114,8 @@ Behavior summary:
 - `@codexask --context=long` uses a larger in-memory transcript buffer for channel analysis, with local hour markers and per-line times.
 - `@codexdeep` includes only the 25 most recent channel lines to resolve query ambiguity; canonical-history tools must verify historical claims.
 - `@codexdeep` searches canonical Soju history for the debate2016 channel lineage and is unavailable in private messages or other channels.
+- Broad historical judgments start with timeline samples rather than only recent topic matches. The model infers scope from the query's meaning; no keyword triggers are used. Community comparisons sample a limited set of human candidates and disclose that limitation.
+- History tools report cumulative dated-message coverage. The model is instructed to expand beyond a single discussion for broad questions and qualify judgments from limited samples. This guidance does not guarantee exhaustive or representative coverage; narrow questions keep their requested date scope.
 - Accepted `@codexdeep` requests immediately acknowledge the requester and summarize the bounded debate2016 history search while the substantive answer is generated.
 - Returned history is untrusted evidence. The model receives only `search`, `search_summary`, `history_summary`, `context`, `conversations`, `speaker_history`, and `aggregate`; it cannot choose another network, target, scope, remote command, or local path.
 - `history_summary` provides exact entire-scope totals and boundary messages; `search_summary` provides exact topical totals and chronological edges; `context` expands a message ID; `search` finds individual evidence; `conversations` reconstructs participant-aware exchanges; `speaker_history` samples a speaker timeline; and `aggregate` groups exact counts by sender/day/week/month/year.
@@ -227,8 +229,13 @@ exact per-request quota charge.
 Deep-mode MCP calls append separate metadata-only records to
 `OUTPUT_DIR/soju-tool-telemetry.jsonl`. Each record includes its UTC start time,
 parent Codex request ID, sequential call index, tool/status, duration, response
-size, and available count/completeness fields. Queries and returned message
-bodies are never logged.
+size, and available count/completeness fields. Records also include effective
+date bounds, ordering, sampling mode, speaker nicknames, limits, per-call and
+cumulative dated-message coverage, and categorical rejection reasons. Coverage
+deduplicates message IDs and counts dates in returned messages, including nested
+conversation fragments; summary bounds and aggregate buckets are not inspected
+message evidence. Queries, returned message bodies, and raw error text are never
+logged.
 
 ## Tests
 

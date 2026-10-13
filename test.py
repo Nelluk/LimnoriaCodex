@@ -1139,7 +1139,10 @@ class CodexWrapperUnitTest(unittest.TestCase):
         self.assertNotIn("CODEX_THREAD_ID", child_env)
 
     def test_exec_command_is_ephemeral_strict_and_tool_disabled(self):
-        settings = codex_wrapper._runtime_settings(codex_wrapper.MODE_ASK, reasoning_effort="xhigh")
+        settings = codex_wrapper._runtime_settings(
+            codex_wrapper.MODE_ASK, reasoning_effort="xhigh",
+            web_search_context_size="high",
+        )
         layout = {"agent_cwd": os.path.join(self.tmpdir, "agent-cwd")}
         cmd = codex_wrapper._exec_command(
             "/opt/codex/bin/codex",
@@ -1476,6 +1479,7 @@ class SojuHistoryToolsUnitTest(unittest.TestCase):
         )
         self.env_patch.start()
         soju_history_tools._tool_call_count = 0
+        soju_history_tools._evidence_times.clear()
 
     def tearDown(self):
         self.env_patch.stop()
@@ -1884,15 +1888,94 @@ class SojuHistoryToolsUnitTest(unittest.TestCase):
         self.assertEqual(telemetry["call_index"], 4)
         self.assertEqual(telemetry["matching_messages"], 1)
         self.assertEqual(telemetry["messages_returned"], 1)
+        self.assertEqual(telemetry["request"]["to_time"], "2026-08-17T21:30:28.000Z")
+        self.assertTrue(telemetry["request"]["query_present"])
+        self.assertEqual(telemetry["returned_coverage"]["first_time"], "2025-01-01T00:00:00.000Z")
+        self.assertEqual(telemetry["cumulative_coverage"]["distinct_days"], 1)
         self.assertIn("duration_ms", telemetry)
         self.assertIn("response_bytes", telemetry)
         self.assertEqual(telemetry_records[1]["status"], "rejection")
         self.assertEqual(telemetry_records[1]["tool"], "search")
         self.assertEqual(telemetry_records[1]["request_id"], "parent-request-123")
         self.assertEqual(telemetry_records[1]["call_index"], 5)
+        self.assertEqual(telemetry_records[1]["rejection_reason"], "arguments")
+        self.assertEqual(telemetry_records[1]["request"]["until_time"], "2024-01-01T00:00:00.000Z")
         self.assertNotIn("SECRET QUERY TEXT", telemetry_text)
         self.assertNotIn("ANOTHER SECRET QUERY", telemetry_text)
         self.assertNotIn("SECRET MESSAGE BODY", telemetry_text)
+
+    def test_coverage_deduplicates_messages_and_ignores_summary_bounds(self):
+        times = {}
+        first = {"id": 7, "time": "2025-01-01T00:00:00Z", "text": "evidence"}
+        soju_history_tools._evidence_coverage([first], times)
+        coverage = soju_history_tools._evidence_coverage([
+            first,
+            {"type": "conversation", "messages": [
+                first, {"id": 8, "time": "2020-02-03T04:05:06Z"},
+                {"id": 9, "time": "invalid"},
+            ]},
+            {"type": "summary", "first_time": "2018-01-01T00:00:00Z",
+             "last_time": "2026-01-01T00:00:00Z"},
+        ], times)
+        self.assertEqual(coverage, {
+            "dated_messages": 2, "distinct_days": 2, "distinct_years": 2,
+            "first_time": "2020-02-03T04:05:06.000Z",
+            "last_time": "2025-01-01T00:00:00.000Z",
+        })
+
+    def test_mcp_reports_cumulative_coverage_and_resets_on_initialize(self):
+        completed = types.SimpleNamespace(returncode=0, stdout=(
+            '{"id":7,"time":"2025-01-01T00:00:00Z","text":"evidence"}\n'
+        ))
+        with mock.patch.object(soju_history_tools.subprocess, "run", return_value=completed):
+            response = soju_history_tools._handle_request({
+                "id": 1, "method": "tools/call",
+                "params": {"name": "search", "arguments": {"query": "topic"}},
+            })
+        content = response["result"]["content"]
+        self.assertEqual(json.loads(content[0]["text"])["id"], 7)
+        coverage = json.loads(content[1]["text"].splitlines()[0])
+        self.assertEqual(coverage["type"], "history_evidence_coverage")
+        self.assertEqual(coverage["distinct_days"], 1)
+        self.assertIn("not archive completeness", content[1]["text"])
+        soju_history_tools._handle_request({"id": 2, "method": "initialize"})
+        self.assertEqual(soju_history_tools._evidence_times, {})
+
+    def test_request_telemetry_records_scope_without_arbitrary_arguments(self):
+        metadata = soju_history_tools._request_telemetry({
+            "query": "private text", "speaker_group": ["alice", "alice_"],
+            "mode": "sample", "limit": 40, "order": "asc",
+            "from_time": "2020-01-01T00:00:00Z", "credential": "secret",
+            "id": 123, "exclude_senders": ["bot"],
+        })
+        self.assertEqual(metadata["speaker_group"], ["alice", "alice_"])
+        self.assertEqual(metadata["mode"], "sample")
+        self.assertEqual(metadata["order"], "asc")
+        self.assertNotIn("query", metadata)
+        self.assertNotIn("credential", metadata)
+        self.assertNotIn("id", metadata)
+        self.assertNotIn("exclude_senders", metadata)
+        invalid = soju_history_tools._request_telemetry({
+            "from_time": "private text", "mode": "private text",
+            "order": "private text", "group_by": "private text",
+        })
+        self.assertEqual(invalid, {"query_present": False})
+
+    def test_rejection_telemetry_omits_remote_error_text(self):
+        telemetry_path = os.path.join(self.tmpdir, "rejections.jsonl")
+        completed = types.SimpleNamespace(
+            returncode=1, stdout='{"error":"PRIVATE REMOTE ERROR"}\n',
+        )
+        with mock.patch.dict(os.environ, {
+            soju_history_tools.TELEMETRY_PATH_ENV: telemetry_path,
+        }), mock.patch.object(soju_history_tools.subprocess, "run", return_value=completed):
+            with self.assertRaises(soju_history_tools.ToolError):
+                soju_history_tools._call_transport("search", {"query": "private"})
+        with open(telemetry_path, encoding="utf-8") as handle:
+            encoded = handle.read()
+        self.assertEqual(json.loads(encoded)["rejection_reason"], "remote_error")
+        self.assertNotIn("PRIVATE REMOTE ERROR", encoded)
+        self.assertEqual(soju_history_tools._evidence_times, {})
 
     def test_transport_cutoff_overwrites_argument_value(self):
         completed = types.SimpleNamespace(

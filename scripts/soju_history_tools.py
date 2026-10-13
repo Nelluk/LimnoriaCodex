@@ -20,6 +20,7 @@ MAX_REQUEST_BYTES = 16 * 1024
 MAX_RESPONSE_BYTES = 1_000_000
 TRANSPORT_TIMEOUT_SECONDS = 30
 _tool_call_count = 0
+_evidence_times = {}
 
 
 class ToolError(Exception):
@@ -418,6 +419,77 @@ def _response_telemetry(records):
     return metadata
 
 
+def _evidence_coverage(records, times=None):
+    """Count dated message IDs, including nested conversation messages.
+
+    Summary bounds and aggregate buckets are not inspected message evidence.
+    Repeated context expansion must not inflate the coverage count.
+    """
+    if times is None:
+        times = {}
+
+    def visit(record):
+        message_id = record.get("id")
+        stamp = record.get("time")
+        if isinstance(message_id, int) and not isinstance(message_id, bool):
+            try:
+                normalized, _ = _normalize_utc_timestamp(stamp, "message time")
+            except ToolError:
+                pass
+            else:
+                times[message_id] = normalized
+        messages = record.get("messages")
+        if isinstance(messages, list):
+            for message in messages:
+                if isinstance(message, dict):
+                    visit(message)
+
+    for record in records:
+        visit(record)
+    stamps = list(times.values())
+    return {
+        "dated_messages": len(stamps),
+        "first_time": min(stamps) if stamps else None,
+        "last_time": max(stamps) if stamps else None,
+        "distinct_days": len({stamp[:10] for stamp in stamps}),
+        "distinct_years": len({stamp[:4] for stamp in stamps}),
+    }
+
+
+def _request_telemetry(request):
+    # Explicit allowlist: never persist query text, arbitrary fields, or IDs.
+    if not isinstance(request, dict):
+        return {}
+    metadata = {}
+    for key in ("from_time", "until_time", "to_time"):
+        if key in request:
+            try:
+                metadata[key], _ = _normalize_utc_timestamp(request[key], key)
+            except ToolError:
+                pass
+    choices = {
+        "order": ("asc", "desc", "count-desc", "count-asc", "key-asc", "key-desc"),
+        "mode": ("sample", "oldest", "newest"),
+        "group_by": ("sender", "day", "week", "month", "year"),
+    }
+    for key, allowed in choices.items():
+        if request.get(key) in allowed:
+            metadata[key] = request[key]
+    for key in ("limit", "before", "after", "candidate_limit"):
+        value = request.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            metadata[key] = value
+    if isinstance(request.get("summary_only"), bool):
+        metadata["summary_only"] = request["summary_only"]
+    speakers = request.get("speaker_group")
+    if isinstance(speakers, list):
+        metadata["speaker_group"] = [
+            nick[:100] for nick in speakers[:20] if isinstance(nick, str)
+        ]
+    metadata["query_present"] = bool(request.get("query"))
+    return metadata
+
+
 def _parent_request_id():
     candidate = os.environ.get(REQUEST_ID_ENV, "").strip()
     if not candidate or len(candidate) > 64:
@@ -488,12 +560,16 @@ def _call_transport(command, arguments, call_index=None):
         "+00:00", "Z"
     )
     response_bytes = 0
-    metadata = {}
+    metadata = {"request": _request_telemetry(arguments)}
+    rejection_reason = "configuration"
     try:
         config_path = _transport_config()
+        rejection_reason = "arguments"
         request = _prepare_request(command, arguments)
+        metadata["request"] = _request_telemetry(request)
         encoded = json.dumps(request, ensure_ascii=True, separators=(",", ":")) + "\n"
         if len(encoded.encode("utf-8")) > MAX_REQUEST_BYTES:
+            rejection_reason = "request_size"
             raise ToolError("history request exceeds the transport safety limit")
         env = {
             TRANSPORT_CONFIG_ENV: config_path,
@@ -501,6 +577,7 @@ def _call_transport(command, arguments, call_index=None):
             "LANG": os.environ.get("LANG", "C.UTF-8"),
         }
         try:
+            rejection_reason = "transport"
             proc = subprocess.run(
                 [CLIENT_PATH],
                 input=encoded,
@@ -512,20 +589,26 @@ def _call_transport(command, arguments, call_index=None):
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
+            rejection_reason = "timeout"
             raise ToolError("canonical history query timed out") from exc
         except OSError as exc:
             raise ToolError("canonical history transport could not start") from exc
         output = proc.stdout or ""
         response_bytes = len(output.encode("utf-8"))
         if response_bytes > MAX_RESPONSE_BYTES:
+            rejection_reason = "response_size"
             raise ToolError("canonical history response exceeded the safety limit")
         remote_error = _safe_remote_error(output)
         if remote_error:
+            rejection_reason = "remote_error"
             raise ToolError(remote_error)
         if proc.returncode != 0:
             raise ToolError("canonical history transport failed")
+        rejection_reason = "malformed_response"
         records = _compact_records(command, _parse_ndjson(output))
-        metadata = _response_telemetry(records)
+        metadata.update(_response_telemetry(records))
+        metadata["returned_coverage"] = _evidence_coverage(records)
+        metadata["cumulative_coverage"] = _evidence_coverage(records, _evidence_times)
         rendered = "\n".join(
             json.dumps(record, ensure_ascii=True, separators=(",", ":"))
             for record in records
@@ -541,6 +624,7 @@ def _call_transport(command, arguments, call_index=None):
         )
         return rendered or "No matching history was found."
     except ToolError:
+        metadata["rejection_reason"] = rejection_reason
         _write_tool_telemetry(
             command,
             "rejection",
@@ -552,6 +636,7 @@ def _call_transport(command, arguments, call_index=None):
         )
         raise
     except Exception:
+        metadata["rejection_reason"] = "internal_error"
         _write_tool_telemetry(
             command,
             "rejection",
@@ -601,6 +686,7 @@ def _handle_request(request):
     method = request.get("method")
     if method == "initialize":
         _tool_call_count = 0
+        _evidence_times.clear()
         requested = (request.get("params") or {}).get("protocolVersion")
         return _result(
             request_id,
@@ -649,6 +735,20 @@ def _handle_request(request):
                 tool["command"], arguments, call_index=_tool_call_count
             )
             content = [{"type": "text", "text": text}]
+            if _evidence_times:
+                coverage = {
+                    "type": "history_evidence_coverage",
+                    **_evidence_coverage([], _evidence_times),
+                }
+                content.append({
+                    "type": "text",
+                    "text": json.dumps(coverage) + "\n"
+                            "Coverage describes dated messages inspected across this request, "
+                            "not archive completeness or representativeness. For broad historical "
+                            "judgments concentrated in one discussion, expand across the requested "
+                            "timeline with speaker_history mode=sample before answering. "
+                            "Keep narrow questions within their requested scope.",
+                })
             if _tool_call_count >= TOOL_BUDGET_WARNING_CALL:
                 remaining = MAX_TOOL_CALLS - _tool_call_count
                 content.append(
