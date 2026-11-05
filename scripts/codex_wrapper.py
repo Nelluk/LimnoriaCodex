@@ -349,6 +349,24 @@ def _toml_string(value):
     return json.dumps(str(value), ensure_ascii=True)
 
 
+def _markets_output_schema(format_name):
+    if format_name == "overview":
+        return markets_support.output_schema()
+    # The already-running plugin retains its old prompt/renderer until restart.
+    # Keep its wire format working while the new source is staged on disk.
+    string = {"type": "string"}
+    event = {"type": "object", "properties": {
+        "platform": {"type": "string", "enum": ["polymarket", "kalshi"]},
+        "event_id": string, "outcome_ids": {"type": "array", "items": string, "minItems": 1, "maxItems": 3},
+    }, "required": ["platform", "event_id", "outcome_ids"], "additionalProperties": False}
+    group = {"type": "object", "properties": {"label": string, "note": string,
+        "events": {"type": "array", "items": event, "minItems": 1, "maxItems": 2}},
+        "required": ["label", "note", "events"], "additionalProperties": False}
+    return {"type": "object", "properties": {"interpretation": string,
+        "groups": {"type": "array", "items": group, "maxItems": 3}},
+        "required": ["interpretation", "groups"], "additionalProperties": False}
+
+
 def _exec_command(codex_binary, settings, layout, output_path, markets_request_dir=None):
     cmd = [
         codex_binary,
@@ -417,9 +435,9 @@ def _exec_command(codex_binary, settings, layout, output_path, markets_request_d
     if settings.get("markets"):
         if not markets_request_dir:
             raise RuntimeError("markets mode requires a private request directory")
-        schema_path = os.path.join(markets_request_dir, "selection-schema.json")
+        schema_path = os.path.join(markets_request_dir, "markets-output-schema.json")
         with open(schema_path, "w", encoding="utf-8") as handle:
-            json.dump(markets_support.selection_schema(), handle)
+            json.dump(_markets_output_schema(settings.get("markets_output", "overview")), handle)
         tools_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "markets.py")
         cmd.extend((
             "--output-schema", schema_path,
@@ -994,7 +1012,12 @@ def main():
     )
     parser.add_argument("--markets-request-dir", default=None,
                         help="Private evidence directory, required only for markets mode.")
+    parser.add_argument("--markets-output", choices=("overview", "selection"), default=None,
+                        help="Markets response format; older callers default to selection until their next restart.")
     args = parser.parse_args()
+    if args.mode != MODE_MARKETS and args.markets_output:
+        print("markets output format is valid only in markets mode", file=sys.stderr)
+        return 2
     if args.mode == MODE_MARKETS:
         if args.context_policy != "none" or not args.markets_request_dir or not os.path.isdir(args.markets_request_dir):
             print("markets mode requires context none and an existing private request directory", file=sys.stderr)
@@ -1018,6 +1041,8 @@ def main():
     except RuntimeError as exc:
         print(str(exc)[:300], file=sys.stderr)
         return 2
+    if args.mode == MODE_MARKETS:
+        settings["markets_output"] = args.markets_output or "selection"
     if args.mode == MODE_DEEP:
         try:
             soju_transport_config = _resolve_soju_transport_config(

@@ -1105,7 +1105,7 @@ class Codex(callbacks.Plugin):
         if mode == MODE_MARKETS:
             if context_policy != CONTEXT_NONE or not markets_request_dir or web_search_context_size:
                 raise WrapperExecutionError("markets mode requires context none and a private request directory")
-            cmd.extend(("--markets-request-dir", markets_request_dir))
+            cmd.extend(("--markets-request-dir", markets_request_dir, "--markets-output", "overview"))
         elif markets_request_dir:
             raise WrapperExecutionError("markets evidence directory is valid only in markets mode")
 
@@ -1404,19 +1404,19 @@ class Codex(callbacks.Plugin):
                     context_policy=CONTEXT_NONE, markets_request_dir=request_dir,
                 )
                 if len(output) > 30_000:
-                    raise ValueError("Oversized Markets selection")
-                selection = json.loads(output)
-                groups = markets_support.validate_selection(selection, request_dir)
+                    raise ValueError("Oversized Markets output")
+                overview, report = markets_support.validate_output(json.loads(output), request_dir)
                 coverage_path = os.path.join(request_dir, "searches.json")
                 with open(coverage_path, encoding="utf-8") as handle:
                     searches = json.load(handle)
                 markets_support.validate_coverage(query, searches)
-                report = markets_support.render(query, selection, groups, searches)
+                failed = builtins.any(item["status"] == "failed" for item in searches)
+                if failed:
+                    report += "\nSome lookups failed; source coverage may be incomplete.\n"
                 report_path = os.path.join(paths["output"], "markets-" + uuid.uuid4().hex + ".md")
                 with open(report_path, "w", encoding="utf-8") as handle:
                     handle.write(report)
                 suffix = ""
-                failed = builtins.any(item["status"] == "failed" for item in searches)
                 if self.registryValue("marketsPublishEnabled"):
                     try:
                         suffix = " | " + markets_support.publish(report)
@@ -1427,10 +1427,7 @@ class Codex(callbacks.Plugin):
                     suffix = " | Report publishing disabled"
                 if failed:
                     suffix = " | Some lookups failed" + suffix
-                if not groups and failed:
-                    irc.reply("No suitable markets selected; source coverage was incomplete." + suffix, prefixNick=False)
-                else:
-                    irc.reply(markets_support.summary(groups, suffix), prefixNick=False)
+                irc.reply(markets_support.channel_summary(overview, suffix), prefixNick=False)
         except WrapperTimeoutError:
             irc.reply("Markets search timed out. Please try a more specific query.", prefixNick=False)
         except WrapperExecutionError as exc:
@@ -1438,7 +1435,7 @@ class Codex(callbacks.Plugin):
             irc.reply(self._friendly_wrapper_error(exc), prefixNick=False)
         except Exception:
             self.log.exception("Markets request failed")
-            irc.reply("Markets could not produce a verified answer. Please try again.", prefixNick=False)
+            irc.reply("Markets could not produce an overview. Please try again.", prefixNick=False)
         finally:
             self._release_execution_slot()
 

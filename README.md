@@ -286,42 +286,36 @@ quote summary, and links a Markdown report on pasters.io. Examples:
 @markets Kalshi Texas Senate
 ```
 
-Markets defaults to `gpt-6.1-terra` with low effort. It uses only the explicit
-query, without channel history or persistent memory. Hosted web search is off;
-a dedicated read-only MCP server exposes `search_markets` and `get_event`, with
-at most 12 calls per request. Both platforms must be searched unless the query
-explicitly names only one. There are no trading, account, shell, or publishing
-tools available to the model.
+Markets defaults to `gpt-6.1-terra` with low effort. It uses the explicit query,
+without channel history or persistent memory. Hosted web search is off; a
+read-only MCP server exposes `search_markets` and `get_event`, with at most 12
+calls per request. Both platforms must be searched unless the query explicitly
+names only one. The model has no trading, account, shell, or publishing tools.
 
-Search results are candidates. Selected events must have fetched details, and
-every selected outcome must exist in that request's evidence and be active.
-Repeated detail lookups reuse one snapshot. The model returns schema-constrained
-event/outcome selections; Python inserts all quotes and source links, escapes
-untrusted report text, and publishes only after validation. Resolution comparisons
-and selection notes are model judgments, not independently verified conclusions.
+The model writes a short IRC overview and a concise Markdown report directly
+from fetched details. It recognizes equivalent names, chooses informative
+markets and outcomes, and uses one approximate percentage when venues broadly
+agree. Significant disagreement can be shown as a range or explanation. Platform
+identities and separate quotes appear only when useful. Broad sports queries
+favor varied season-wide markets; supplementary markets should add information.
 
-Displayed percentages use valid two-sided Yes quotes without a redundant price-type
-suffix. Last-trade and provider-price fallbacks remain explicitly labeled. The
-channel pairs equivalent outcomes as `47%/45%` under `(Poly/Kalshi)`, uses bold
-headings, and highlights 24-hour moves of at least 5 percentage points with a
-bold quote and directional arrow. It keeps within 400 UTF-8 bytes including the
-report link, dropping whole secondary outcomes before shortening names.
+The channel aims for 150–250 bytes before the report link, with sensible rounding
+and optional arrows/bold for meaningful 24-hour moves. The report usually runs
+100–250 words, with relevant source links, useful context, and small tables when
+helpful. It omits mirrored quote dumps, routine rule boilerplate, raw search
+traces, and negligible outcome tails. Fewer topics are fine.
 
-Name matching normalizes accents and punctuation. Paired team markets in the
-same supported league can match a city (or city plus team initial) to a uniquely identified full team name
-using all fetched outcomes. Ambiguous cities and same-event name collisions stay
-separate. Channel comparisons can fill a matching counterpart from the fetched
-event even when the model selected a different set of leaders on that platform.
-Broad league queries are prompted to prioritize season-wide futures and awards;
-individual games require a user-requested game/date/team scope and a verified date.
+Python checks response shape, size, source-search coverage, and that report links
+came from fetched event records. It sanitizes raw HTML/control characters,
+converts Markdown bold for IRC, enforces the 400-byte channel limit, and publishes
+the report. Prices, identity matching, approximations, and editorial judgments
+are model-written; Python does not reconstruct or independently verify each
+printed figure. There is no separate alignment engine or second model call.
 
-Reports align both platforms in one table per group, show up to 10 relevant
-outcomes with 24-hour changes, and highlight the same large moves. Source links
-lead to full outcome lists and resolution rules. Raw search traces, repeated
-contract rules, and long tails of negligible outcomes are omitted. Polymarket
-changes use its native `oneDayPriceChange`; Kalshi changes compare the same quote
-type against its day-ago fields. Missing or incompatible historical quotes leave
-the change blank. Scheduled end dates alone do not determine trading status.
+Provider data preserves quote types, activity units, and 24-hour changes.
+Polymarket uses its native `oneDayPriceChange`; Kalshi compares like-for-like
+quotes with its day-ago fields. Missing changes stay unavailable. Repeated event
+lookups reuse one request snapshot. Scheduled dates alone do not establish closure.
 
 ```irc
 @config plugins.codex.marketsModel gpt-6.1-terra
@@ -353,6 +347,11 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/path/to/limnoria \
 ```
 
 Standalone integration testing may invoke `scripts/codex_wrapper.py` with
-`--mode markets --context-policy none --markets-request-dir <private-directory>`.
-Use `markets.prompt(query)` as stdin. This returns selections and retains tool
-records for validation; it never publishes or sends IRC messages by itself.
+`--mode markets --context-policy none --markets-output overview` and
+`--markets-request-dir <private-directory>`.
+Use `markets.prompt(query)` as stdin. This returns the overview/report JSON and retains tool
+records for inspection; it never publishes or sends IRC messages by itself.
+
+The wrapper temporarily accepts the previous selection JSON format for an
+already-running plugin during source updates. The new command explicitly requests
+`--markets-output overview`; its behavior activates after the bot restart.

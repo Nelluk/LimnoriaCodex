@@ -2,6 +2,7 @@
 import io
 import json
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -19,10 +20,9 @@ def event():
                          {"id": "old", "label": "Old contract", "status": "closed", "rules": "", **markets.quote_fields(.9, .95, .91)}]}
 
 
-def selection():
-    return {"interpretation": "Republican House seats after the midterms.", "groups": [
-        {"label": "House seats", "note": "Lower brackets distinguish the likely seat counts.",
-         "events": [{"platform": "polymarket", "event_id": "house-lower", "outcome_ids": ["170"]}]}]}
+def overview():
+    return {"irc_summary": "House seats: 170–174 ~47%",
+            "report_markdown": "# House seats\n\nThe 170–174 bracket is around 47%.\n\n[Polymarket](https://polymarket.com/event/house-lower)\n"}
 
 
 class MarketBehaviorTest(unittest.TestCase):
@@ -99,40 +99,6 @@ class MarketBehaviorTest(unittest.TestCase):
             self.assertFalse(result["closed"])
             self.assertEqual(result["outcomes"][0]["id"], "TEST-28-A")
 
-    def test_unknown_closed_duplicate_or_unfetched_selections_are_rejected(self):
-        for bad_id in ("invented", "old"):
-            s = selection()
-            s["groups"][0]["events"][0]["outcome_ids"] = [bad_id]
-            with self.assertRaises(ValueError):
-                markets.validate_selection(s, self.directory)
-        s = selection()
-        s["groups"][0]["events"][0]["event_id"] = "unfetched"
-        with self.assertRaises(ValueError):
-            markets.validate_selection(s, self.directory)
-        s = selection()
-        s["groups"] *= 2
-        with self.assertRaises(ValueError):
-            markets.validate_selection(s, self.directory)
-        self.e["outcomes"][0]["accepting_orders"] = False
-        markets.save_json(markets.evidence_path(self.directory, "polymarket", "house-lower"), self.e)
-        with self.assertRaises(ValueError):
-            markets.validate_selection(selection(), self.directory)
-
-    def test_render_uses_evidence_quotes_and_escapes_untrusted_markdown(self):
-        s = selection()
-        groups = markets.validate_selection(s, self.directory)
-        groups[0]["label"] = '<script>alert(1)</script> [click](https://evil.test)'
-        report = markets.render("House seats", s, groups, [])
-        self.assertIn("47%", report)
-        self.assertIn("| Outcome | [Polymarket]", report)
-        self.assertNotIn("% mid", report)
-        self.assertNotIn("<script>", report)
-        self.assertNotIn("[click](https://evil.test)", report)
-        self.assertNotIn("Old contract", report)
-        summary = markets.summary(groups, " | https://pasters.io/abc.md", max_bytes=170)
-        self.assertLessEqual(len(summary.encode()), 170)
-        self.assertTrue(summary.endswith("https://pasters.io/abc.md"))
-
     def test_daily_changes_use_provider_delta_and_matching_kalshi_quote_basis(self):
         poly = markets.poly_outcome({"id": "a", "outcomes": ["Yes", "No"], "outcomePrices": [.7, .3], "oneDayPriceChange": .12})
         self.assertEqual(poly["change_24h"], .12)
@@ -145,122 +111,6 @@ class MarketBehaviorTest(unittest.TestCase):
         named = markets.poly_outcomes({"id": "party", "outcomes": ["Democratic", "Republican"],
                                       "outcomePrices": [.7, .3], "oneDayPriceChange": .1})
         self.assertEqual([o["change_24h"] for o in named], [.1, -.1])
-
-    def test_channel_highlights_only_large_changes_and_has_balanced_formatting(self):
-        s = selection()
-        groups = markets.validate_selection(s, self.directory)
-        outcome = groups[0]["events"][0][1][0]
-        outcome["change_24h"] = .061
-        text = markets.summary(groups)
-        self.assertIn("47% (⬆️6.1 pp)", text)
-        self.assertNotIn("mid", text)
-        self.assertEqual(text.count("\x02") % 2, 0)
-        outcome["change_24h"] = -.049
-        self.assertNotIn("🔻", markets.summary(groups))
-        outcome["change_24h"] = -.05
-        self.assertIn("🔻5 pp", markets.summary(groups))
-        report = markets.render("House seats", s, groups, [])
-        self.assertIn("**47%**", report)
-        self.assertIn("**🔻5 pp**", report)
-
-    def test_equivalent_outcomes_align_without_repeating_names_or_merging_thresholds(self):
-        s = selection()
-        groups = markets.validate_selection(s, self.directory)
-        left = {**groups[0]["events"][0][1][0], "label": "J.D. Vance", "price": .47}
-        right = {**left, "label": "JD Vance", "price": .45}
-        e1 = {**event(), "outcomes": [left]}
-        e2 = {**event(), "platform": "kalshi", "outcomes": [right]}
-        groups[0]["events"] = [(e1, [left]), (e2, [right])]
-        text = markets.summary(groups)
-        self.assertEqual(text.count("Vance"), 1)
-        self.assertIn("47%/45%", text)
-        report = markets.render("Nominee", s, groups, [])
-        self.assertIn("| J\\.D\\. Vance | 47% | — | 45% | — |", report)
-        self.assertNotEqual(markets.outcome_key("At least 174"), markets.outcome_key("170-174"))
-        self.assertEqual(markets.outcome_key("Democratic party"), markets.outcome_key("Democratic"))
-
-    def test_summary_prunes_whole_outcomes_before_cutting_any_quote(self):
-        groups = markets.validate_selection(selection(), self.directory)
-        event_record, outcomes = groups[0]["events"][0]
-        outcomes[:] = [{**outcomes[0], "id": str(i), "label": "Candidate " + str(i), "change_24h": .1} for i in range(3)]
-        event_record["outcomes"] = outcomes
-        text = markets.summary(groups, " | https://pasters.io/a.md", max_bytes=135)
-        self.assertLessEqual(len(text.encode()), 135)
-        self.assertEqual(text.count("\x02") % 2, 0)
-        self.assertIn("47%", text)
-        self.assertNotIn("Candidate 2", text)
-        self.assertTrue(text.endswith("https://pasters.io/a.md"))
-
-    def test_report_orders_brackets_and_omits_unselected_zero_price_placeholders(self):
-        groups = markets.validate_selection(selection(), self.directory)
-        e, selected = groups[0]["events"][0]
-        base = selected[0]
-        e["outcomes"] = [{**base, "id": str(i), "label": label, "price": price} for i, (label, price) in enumerate([
-            ("175-179", .53), ("Below 170", .01), ("170-174", .46), ("190+", .001)])]
-        groups[0]["events"] = [(e, [e["outcomes"][0]])]
-        rows = markets.comparison_rows(groups[0]["events"])
-        self.assertEqual([label for label, _ in rows], ["Below 170", "170-174", "175-179"])
-        # Explicitly selected long-shot outcomes are retained.
-        groups[0]["events"] = [(e, [e["outcomes"][-1]])]
-        self.assertIn("190+", [label for label, _ in markets.comparison_rows(groups[0]["events"])])
-
-    def sports_event(self, platform, title, labels, selected=None):
-        e = {**event(), "platform": platform, "title": title, "event_id": "test-" + platform}
-        base = e["outcomes"][0]
-        e["outcomes"] = [{**base, "id": platform + str(i), "label": label, "price": .23 - i * .03} for i, label in enumerate(labels)]
-        return e, [e["outcomes"][i] for i in (selected if selected is not None else range(min(3, len(labels))))]
-
-    def test_nba_full_team_names_and_city_names_share_one_row_in_both_source_orders(self):
-        poly = self.sports_event("polymarket", "NBA: 2027 Champion", ["San Antonio Spurs", "Philadelphia 76ers", "Oklahoma City Thunder"])
-        kalshi = self.sports_event("kalshi", "2027 Pro Basketball Champion", ["San Antonio", "Philadelphia", "Oklahoma City"])
-        for events in ([poly, kalshi], [kalshi, poly]):
-            rows = markets.comparison_rows(events, selected_only=True)
-            self.assertEqual(len(rows), 3)
-            self.assertTrue(all(all(o is not None for o in quotes) for _, quotes in rows))
-            self.assertIn("San Antonio Spurs", [label for label, _ in rows])
-            groups = [{"label": "2027 champion", "note": "", "events": events}]
-            text = markets.summary(groups)
-            self.assertEqual(text.count("San Antonio"), 1)
-            self.assertNotIn("/—", text)
-
-    def test_counterpart_is_filled_from_fetched_quotes_even_when_not_selected(self):
-        poly = self.sports_event("polymarket", "NBA Champion", ["San Antonio Spurs", "Philadelphia 76ers"], selected=[0])
-        kalshi = self.sports_event("kalshi", "Pro Basketball Champion", ["San Antonio", "Philadelphia"], selected=[1])
-        rows = markets.comparison_rows([poly, kalshi], selected_only=True)
-        self.assertEqual(len(rows), 2)
-        self.assertTrue(all(all(o is not None for o in quotes) for _, quotes in rows))
-
-    def test_city_with_multiple_teams_is_not_guessed_from_selected_leaders(self):
-        poly = self.sports_event("polymarket", "NBA Champion", ["Los Angeles Lakers", "Los Angeles Clippers"], selected=[0])
-        kalshi = self.sports_event("kalshi", "Pro Basketball Champion", ["Los Angeles"], selected=[0])
-        rows = markets.comparison_rows([poly, kalshi], selected_only=True)
-        self.assertEqual(len(rows), 2)
-        self.assertTrue(all(sum(o is not None for o in quotes) == 1 for _, quotes in rows))
-
-    def test_team_initials_disambiguate_city_with_two_teams(self):
-        poly = self.sports_event("polymarket", "NBA Champion", ["Los Angeles Lakers", "Los Angeles Clippers"])
-        kalshi = self.sports_event("kalshi", "Pro Basketball Champion", ["Los Angeles L", "Los Angeles C"])
-        rows = markets.comparison_rows([poly, kalshi], selected_only=True)
-        self.assertEqual(len(rows), 2)
-        for label, quotes in rows:
-            self.assertTrue(all(o is not None for o in quotes))
-            self.assertEqual(quotes[1]["label"], "Los Angeles L" if label.endswith("Lakers") else "Los Angeles C")
-
-    def test_prefix_matching_does_not_apply_to_player_awards_or_unrelated_markets(self):
-        for title in ("NBA MVP", "Election winner"):
-            left = self.sports_event("polymarket", title, ["Nikola Jokic"])
-            right = self.sports_event("kalshi", title, ["Nikola"])
-            self.assertEqual(len(markets.comparison_rows([left, right], selected_only=True)), 2)
-
-    def test_accented_player_names_align_without_collapsing_same_event_contracts(self):
-        left = self.sports_event("polymarket", "NBA MVP", ["Nikola Jokic"])
-        right = self.sports_event("kalshi", "Pro Basketball MVP", ["Nikola Jokić"])
-        rows = markets.comparison_rows([left, right], selected_only=True)
-        self.assertEqual(len(rows), 1)
-        self.assertTrue(all(o is not None for o in rows[0][1]))
-        left = self.sports_event("polymarket", "Election", ["José Garcia", "Jose Garcia"])
-        right = self.sports_event("kalshi", "Election", ["Jose Garcia"])
-        self.assertEqual(len(markets.comparison_rows([left, right], selected_only=True)), 3)
 
     def test_upload_requires_201_and_valid_host_and_returns_markdown_link(self):
         class Response(io.BytesIO):
@@ -301,6 +151,62 @@ class MarketBehaviorTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             codex_wrapper._runtime_settings("markets", web_search_context_size="high")
 
+    def test_staged_wrapper_keeps_running_plugins_old_contract_until_restart(self):
+        for format_name, expected in (("overview", {"irc_summary", "report_markdown"}),
+                                      ("selection", {"interpretation", "groups"})):
+            settings = codex_wrapper._runtime_settings("markets")
+            settings["markets_output"] = format_name
+            cmd = codex_wrapper._exec_command("codex", settings, {"agent_cwd": self.directory}, "/tmp/final", self.directory)
+            schema_path = cmd[cmd.index("--output-schema") + 1]
+            self.assertEqual(set(json.loads(Path(schema_path).read_text())["properties"]), expected)
+
+    def test_model_prose_is_preserved_without_reconstructing_or_pairing_quotes(self):
+        answer = overview()
+        answer["irc_summary"] = "CO-04: Boebert ~4%, Laubacher ~96%"
+        answer["report_markdown"] = "# CO-04\n\nBoth venues put Boebert near 4%.\n\n[Source](https://polymarket.com/event/house-lower)"
+        text, report = markets.validate_output(answer, self.directory)
+        self.assertEqual(text, answer["irc_summary"])
+        self.assertIn("Both venues put Boebert near 4%", report)
+        self.assertNotIn("4%/", markets.channel_summary(text))
+        answer["report_markdown"] = "**[Source](https://polymarket.com/event/house-lower)**"
+        self.assertIn("**[Source]", markets.validate_output(answer, self.directory)[1])
+
+    def test_bad_output_envelopes_empty_content_and_unfetched_links_are_rejected(self):
+        cases = [[], {"groups": []}, {**overview(), "irc_summary": " "},
+                 {**overview(), "report_markdown": "x" * 12001},
+                 {**overview(), "report_markdown": "\x02"},
+                 {**overview(), "report_markdown": "[Source](https://evil.test/)"},
+                 {**overview(), "report_markdown": "[Source](javascript:alert(1))"}]
+        for answer in cases:
+            with self.subTest(answer=str(answer)[:60]), self.assertRaises(ValueError):
+                markets.validate_output(answer, self.directory)
+
+    def test_report_markdown_survives_while_raw_html_and_control_characters_are_disabled(self):
+        answer = overview()
+        answer["report_markdown"] = "# Overview\n\n**Major move**\n\n<script>alert(1)</script>\x02"
+        answer["irc_summary"] = "Result\x02\nhttps://evil.test/"
+        text, report = markets.validate_output(answer, self.directory)
+        self.assertEqual(text, "Result")
+        self.assertIn("# Overview", report)
+        self.assertIn("**Major move**", report)
+        self.assertNotIn("<script>", report)
+        self.assertIn("&lt;script&gt;", report)
+        self.assertNotIn("\x02", report)
+
+    def test_irc_bold_and_topic_shortening_preserve_a_readable_summary_and_link(self):
+        text = "Champion: Spurs ~23% | MVP: **Wembanyama ~36% (⬆️6 pp)** | Extra: " + "irrelevant " * 30
+        suffix = " | https://pasters.io/a.md"
+        result = markets.channel_summary(text, suffix, max_bytes=150)
+        self.assertIn("Champion: Spurs ~23%", result)
+        self.assertIn("\x02Wembanyama", result)
+        self.assertNotIn("irrelevant", result)
+        self.assertEqual(result.count("\x02") % 2, 0)
+        self.assertTrue(result.endswith(suffix))
+        self.assertLessEqual(len(result.encode()), 150)
+        result = markets.channel_summary("**" + "⬆️ important " * 80, suffix)
+        self.assertEqual(result.count("\x02") % 2, 0)
+        self.assertLessEqual(len(result.encode()), 400)
+
 
 class MarketsCommandTest(unittest.TestCase):
     def setUp(self):
@@ -310,41 +216,55 @@ class MarketsCommandTest(unittest.TestCase):
         self.plugin._config.update(marketsModel="gpt-6.1-terra", marketsEffort="low", marketsTimeoutSeconds=120, marketsPublishEnabled=True)
         self.paths = {"base": self.temp.name, "state": self.temp.name, "temp": self.temp.name, "output": self.temp.name}
 
-    def invoke(self, bad=False, publish_error=False):
+    def invoke(self, bad=False, publish_error=False, source_failed=False):
         def wrapper(*args, **kwargs):
             directory = kwargs["markets_request_dir"]
             markets.save_json(markets.evidence_path(directory, "polymarket", "house-lower"), event())
-            markets.save_json(Path(directory) / "searches.json", [{"platform": "polymarket", "query": "house seats", "status": "2 candidates"}, {"platform": "kalshi", "query": "house seats", "status": "0 candidates"}])
-            s = selection()
+            markets.save_json(Path(directory) / "searches.json", [
+                {"platform": "polymarket", "query": "house seats", "status": "2 candidates"},
+                {"platform": "kalshi", "query": "house seats", "status": "failed" if source_failed else "0 candidates"}])
+            answer = overview()
             if bad:
-                s["groups"][0]["events"][0]["outcome_ids"] = ["invented"]
-            return json.dumps(s)
+                answer["report_markdown"] = "[Fake source](https://evil.test/)"
+            return json.dumps(answer)
         with mock.patch.object(self.plugin, "_resolve_runtime_write_paths", return_value=self.paths), mock.patch.object(self.plugin, "_invoke_wrapper", side_effect=wrapper) as run, mock.patch.object(markets, "publish", side_effect=OSError if publish_error else None, return_value="https://pasters.io/test.md") as upload:
             self.plugin._handle_markets_request(self.irc, self.msg, "house seats")
         return run, upload
 
-    def test_command_uses_no_chat_memory_and_publishes_verified_report(self):
+    def test_command_publishes_model_report_and_uses_no_chat_memory(self):
         run, upload = self.invoke()
         self.assertEqual(run.call_args.kwargs["context_policy"], "none")
         self.assertEqual(run.call_args.kwargs["model"], "gpt-6.1-terra")
-        self.assertIn("47%", self.irc.replies[-1])
+        self.assertIn("170–174 ~47%", self.irc.replies[-1])
         self.assertIn("https://pasters.io/test.md", self.irc.replies[-1])
         self.assertEqual(self.plugin._active_executions, 0)
         self.assertEqual(len(list(Path(self.temp.name).glob("markets-*.md"))), 1)
         self.assertEqual([p for p in Path(self.temp.name).glob("markets-*") if p.is_dir()], [])
-        self.assertTrue(upload.called)
+        self.assertIn("# House seats", upload.call_args.args[0])
 
-    def test_invalid_selection_never_published_and_slot_released(self):
+    def test_new_plugin_explicitly_requests_overview_wire_format(self):
+        with mock.patch.object(self.plugin, "_run_child_process", return_value=types.SimpleNamespace(returncode=0, stdout="{}", stderr="")) as run:
+            self.plugin._invoke_wrapper("/bin/echo", "query", 120, self.paths,
+                mode="markets", context_policy="none", markets_request_dir=self.temp.name)
+        cmd = run.call_args.args[0]
+        self.assertEqual(cmd[cmd.index("--markets-output") + 1], "overview")
+
+    def test_bad_response_never_published_and_slot_released(self):
         _, upload = self.invoke(bad=True)
         self.assertFalse(upload.called)
-        self.assertIn("verified answer", self.irc.replies[-1])
+        self.assertIn("produce an overview", self.irc.replies[-1])
         self.assertEqual(self.plugin._active_executions, 0)
 
-    def test_upload_failure_preserves_summary_and_local_report(self):
+    def test_upload_failure_preserves_overview_and_local_report(self):
         self.invoke(publish_error=True)
-        self.assertIn("47%", self.irc.replies[-1])
+        self.assertIn("~47%", self.irc.replies[-1])
         self.assertIn("Report unavailable", self.irc.replies[-1])
         self.assertEqual(len(list(Path(self.temp.name).glob("markets-*.md"))), 1)
+
+    def test_source_failure_is_disclosed_in_report_and_channel(self):
+        _, upload = self.invoke(source_failed=True)
+        self.assertIn("Some lookups failed", self.irc.replies[-1])
+        self.assertIn("source coverage may be incomplete", upload.call_args.args[0])
 
     def test_busy_command_does_not_launch_or_publish(self):
         self.plugin._active_executions = 1
