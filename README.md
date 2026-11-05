@@ -300,11 +300,20 @@ event/outcome selections; Python inserts all quotes and source links, escapes
 untrusted report text, and publishes only after validation. Resolution comparisons
 and selection notes are model judgments, not independently verified conclusions.
 
-Midpoints use valid two-sided Yes quotes, excluding empty boundary quotes. If a
-midpoint is unavailable, last trade or provider-reported outcome prices are labeled
-explicitly. The report includes bid/ask and platform-specific activity units;
-Kalshi contract counts are not treated as Polymarket dollar volume. Scheduled end
-dates alone do not determine trading status.
+Displayed percentages use valid two-sided Yes quotes without a redundant price-type
+suffix. Last-trade and provider-price fallbacks remain explicitly labeled. The
+channel pairs equivalent outcomes as `47%/45%` under `(Poly/Kalshi)`, uses bold
+headings, and highlights 24-hour moves of at least 5 percentage points with a
+bold quote and directional arrow. It keeps within 400 UTF-8 bytes including the
+report link, dropping whole secondary outcomes before shortening names.
+
+Reports align both platforms in one table per group, show up to 10 relevant
+outcomes with 24-hour changes, and highlight the same large moves. Source links
+lead to full outcome lists and resolution rules. Raw search traces, repeated
+contract rules, and long tails of negligible outcomes are omitted. Polymarket
+changes use its native `oneDayPriceChange`; Kalshi changes compare the same quote
+type against its day-ago fields. Missing or incompatible historical quotes leave
+the change blank. Scheduled end dates alone do not determine trading status.
 
 ```irc
 @config plugins.codex.marketsModel gpt-6.1-terra

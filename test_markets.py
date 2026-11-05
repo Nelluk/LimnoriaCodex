@@ -123,14 +123,85 @@ class MarketBehaviorTest(unittest.TestCase):
         groups = markets.validate_selection(s, self.directory)
         groups[0]["label"] = '<script>alert(1)</script> [click](https://evil.test)'
         report = markets.render("House seats", s, groups, [])
-        self.assertIn("47.0% mid", report)
-        self.assertIn("45.0¢", report)
+        self.assertIn("47%", report)
+        self.assertIn("| Outcome | [Polymarket]", report)
+        self.assertNotIn("% mid", report)
         self.assertNotIn("<script>", report)
         self.assertNotIn("[click](https://evil.test)", report)
         self.assertNotIn("Old contract", report)
         summary = markets.summary(groups, " | https://pasters.io/abc.md", max_bytes=170)
         self.assertLessEqual(len(summary.encode()), 170)
         self.assertTrue(summary.endswith("https://pasters.io/abc.md"))
+
+    def test_daily_changes_use_provider_delta_and_matching_kalshi_quote_basis(self):
+        poly = markets.poly_outcome({"id": "a", "outcomes": ["Yes", "No"], "outcomePrices": [.7, .3], "oneDayPriceChange": .12})
+        self.assertEqual(poly["change_24h"], .12)
+        kalshi = {"ticker": "TEST-A", "yes_bid_dollars": ".64", "yes_ask_dollars": ".66",
+                  "previous_yes_bid_dollars": ".50", "previous_yes_ask_dollars": ".52"}
+        self.assertAlmostEqual(markets.kalshi_outcome(kalshi)["change_24h"], .14)
+        kalshi.pop("previous_yes_bid_dollars")
+        kalshi["previous_price_dollars"] = ".51"
+        self.assertIsNone(markets.kalshi_outcome(kalshi)["change_24h"])
+        named = markets.poly_outcomes({"id": "party", "outcomes": ["Democratic", "Republican"],
+                                      "outcomePrices": [.7, .3], "oneDayPriceChange": .1})
+        self.assertEqual([o["change_24h"] for o in named], [.1, -.1])
+
+    def test_channel_highlights_only_large_changes_and_has_balanced_formatting(self):
+        s = selection()
+        groups = markets.validate_selection(s, self.directory)
+        outcome = groups[0]["events"][0][1][0]
+        outcome["change_24h"] = .061
+        text = markets.summary(groups)
+        self.assertIn("47% (⬆️6.1 pp)", text)
+        self.assertNotIn("mid", text)
+        self.assertEqual(text.count("\x02") % 2, 0)
+        outcome["change_24h"] = -.049
+        self.assertNotIn("🔻", markets.summary(groups))
+        outcome["change_24h"] = -.05
+        self.assertIn("🔻5 pp", markets.summary(groups))
+        report = markets.render("House seats", s, groups, [])
+        self.assertIn("**47%**", report)
+        self.assertIn("**🔻5 pp**", report)
+
+    def test_equivalent_outcomes_align_without_repeating_names_or_merging_thresholds(self):
+        s = selection()
+        groups = markets.validate_selection(s, self.directory)
+        left = {**groups[0]["events"][0][1][0], "label": "J.D. Vance", "price": .47}
+        right = {**left, "label": "JD Vance", "price": .45}
+        e1 = {**event(), "outcomes": [left]}
+        e2 = {**event(), "platform": "kalshi", "outcomes": [right]}
+        groups[0]["events"] = [(e1, [left]), (e2, [right])]
+        text = markets.summary(groups)
+        self.assertEqual(text.count("Vance"), 1)
+        self.assertIn("47%/45%", text)
+        report = markets.render("Nominee", s, groups, [])
+        self.assertIn("| J\\.D\\. Vance | 47% | — | 45% | — |", report)
+        self.assertNotEqual(markets.outcome_key("At least 174"), markets.outcome_key("170-174"))
+        self.assertEqual(markets.outcome_key("Democratic party"), markets.outcome_key("Democratic"))
+
+    def test_summary_prunes_whole_outcomes_before_cutting_any_quote(self):
+        groups = markets.validate_selection(selection(), self.directory)
+        event_record, outcomes = groups[0]["events"][0]
+        outcomes[:] = [{**outcomes[0], "label": "Candidate " + str(i), "change_24h": .1} for i in range(3)]
+        text = markets.summary(groups, " | https://pasters.io/a.md", max_bytes=135)
+        self.assertLessEqual(len(text.encode()), 135)
+        self.assertEqual(text.count("\x02") % 2, 0)
+        self.assertIn("47%", text)
+        self.assertNotIn("Candidate 2", text)
+        self.assertTrue(text.endswith("https://pasters.io/a.md"))
+
+    def test_report_orders_brackets_and_omits_unselected_zero_price_placeholders(self):
+        groups = markets.validate_selection(selection(), self.directory)
+        e, selected = groups[0]["events"][0]
+        base = selected[0]
+        e["outcomes"] = [{**base, "id": str(i), "label": label, "price": price} for i, (label, price) in enumerate([
+            ("175-179", .53), ("Below 170", .01), ("170-174", .46), ("190+", .001)])]
+        groups[0]["events"] = [(e, [e["outcomes"][0]])]
+        rows = markets.comparison_rows(groups[0]["events"])
+        self.assertEqual([label for label, _ in rows], ["Below 170", "170-174", "175-179"])
+        # Explicitly selected long-shot outcomes are retained.
+        groups[0]["events"] = [(e, [e["outcomes"][-1]])]
+        self.assertIn("190+", [label for label, _ in markets.comparison_rows(groups[0]["events"])])
 
     def test_upload_requires_201_and_valid_host_and_returns_markdown_link(self):
         class Response(io.BytesIO):
@@ -197,7 +268,7 @@ class MarketsCommandTest(unittest.TestCase):
         run, upload = self.invoke()
         self.assertEqual(run.call_args.kwargs["context_policy"], "none")
         self.assertEqual(run.call_args.kwargs["model"], "gpt-6.1-terra")
-        self.assertIn("47.0% mid", self.irc.replies[-1])
+        self.assertIn("47%", self.irc.replies[-1])
         self.assertIn("https://pasters.io/test.md", self.irc.replies[-1])
         self.assertEqual(self.plugin._active_executions, 0)
         self.assertEqual(len(list(Path(self.temp.name).glob("markets-*.md"))), 1)
@@ -212,7 +283,7 @@ class MarketsCommandTest(unittest.TestCase):
 
     def test_upload_failure_preserves_summary_and_local_report(self):
         self.invoke(publish_error=True)
-        self.assertIn("47.0% mid", self.irc.replies[-1])
+        self.assertIn("47%", self.irc.replies[-1])
         self.assertIn("Report unavailable", self.irc.replies[-1])
         self.assertEqual(len(list(Path(self.temp.name).glob("markets-*.md"))), 1)
 
