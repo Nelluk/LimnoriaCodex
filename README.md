@@ -167,7 +167,7 @@ Codex runtime defaults in `scripts/codex_wrapper.py`:
 Mode-specific defaults:
 
 - `@codexask`: `gpt-6-luna` with `model_reasoning_effort = "high"`, recent IRC and Codex context, and hosted live web search.
-- `@codexdeep`: `gpt-6-luna` with `model_reasoning_effort = "high"`, web search disabled, and only the seven canonical Soju history tools enabled.
+- `@codexdeep`: `gpt-6.1-terra` with `model_reasoning_effort = "high"`, web search disabled, and only the seven canonical Soju history tools enabled.
 
 ## Manual Wrapper Test
 

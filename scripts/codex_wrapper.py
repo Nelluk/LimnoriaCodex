@@ -62,7 +62,7 @@ MODE_PRESETS = {
         "web_search_context_size": None,
     },
     MODE_DEEP: {
-        "model": DEFAULT_MODEL,
+        "model": "gpt-6.1-terra",
         "reasoning_effort": "high",
         "web_search": "disabled",
         "web_search_context_size": None,

@@ -1152,6 +1152,12 @@ class Codex(callbacks.Plugin):
         detail = str(detail or "")
         lowered = detail.lower()
 
+        if "this content was flagged for possible biological risk" in lowered:
+            return (
+                "Codex's safety filter blocked this request for possible biological risk. "
+                "The filter may have considered recent channel context as well as your prompt."
+            )
+
         quota_terms = (
             "usage limit",
             "rate limit",

@@ -563,6 +563,26 @@ class CodexPluginUnitTest(unittest.TestCase):
             ["Codex request failed. Nelluk has been notified."],
         )
 
+    def test_biological_risk_rejection_has_specific_safe_reply(self):
+        with mock.patch.object(
+            self.plugin,
+            "_invoke_wrapper",
+            side_effect=WrapperExecutionError(
+                "This content was flagged for possible biological risk. "
+                "request_id=private-diagnostic https://example.com/private"
+            ),
+        ):
+            self.plugin._handle_codex_request(self.irc, self.msg, "hello")
+
+        self.assertEqual(
+            self.irc.replies,
+            [
+                "Codex's safety filter blocked this request for possible biological risk. "
+                "The filter may have considered recent channel context as well as your prompt."
+            ],
+        )
+        self.assertEqual(self.plugin._active_executions, 0)
+
     def test_auth_error_reply_is_actionable(self):
         with mock.patch.object(
             self.plugin,
@@ -1028,7 +1048,7 @@ class CodexWrapperUnitTest(unittest.TestCase):
         self.assertEqual(ask_high["reasoning_effort"], "xhigh")
         self.assertEqual(ask_high["web_search_context_size"], "high")
         deep = codex_wrapper._runtime_settings(codex_wrapper.MODE_DEEP)
-        self.assertEqual(deep["model"], "gpt-6-luna")
+        self.assertEqual(deep["model"], "gpt-6.1-terra")
         self.assertEqual(deep["reasoning_effort"], "high")
         self.assertEqual(deep["web_search"], "disabled")
         self.assertTrue(deep["soju_history"])
