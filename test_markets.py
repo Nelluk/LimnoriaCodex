@@ -201,7 +201,7 @@ class MarketsCommandTest(unittest.TestCase):
         self.assertIn("https://pasters.io/test.md", self.irc.replies[-1])
         self.assertEqual(self.plugin._active_executions, 0)
         self.assertEqual(len(list(Path(self.temp.name).glob("markets-*.md"))), 1)
-        self.assertEqual(len(list(Path(self.temp.name).glob("markets-*/"))), 0)
+        self.assertEqual([p for p in Path(self.temp.name).glob("markets-*") if p.is_dir()], [])
         self.assertTrue(upload.called)
 
     def test_invalid_selection_never_published_and_slot_released(self):
