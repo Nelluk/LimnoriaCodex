@@ -273,3 +273,69 @@ plugin reload.
 ## License
 
 MIT
+
+## Markets
+
+`@markets <query>` finds relevant Polymarket and Kalshi events, posts a compact
+quote summary, and links a Markdown report on pasters.io. Examples:
+
+```irc
+@markets nomination
+@markets Republican House seats after the 2026 midterms
+@markets 2028
+@markets Kalshi Texas Senate
+```
+
+Markets defaults to `gpt-6.1-terra` with low effort. It uses only the explicit
+query, without channel history or persistent memory. Hosted web search is off;
+a dedicated read-only MCP server exposes `search_markets` and `get_event`, with
+at most 12 calls per request. Both platforms must be searched unless the query
+explicitly names only one. There are no trading, account, shell, or publishing
+tools available to the model.
+
+Search results are candidates. Selected events must have fetched details, and
+every selected outcome must exist in that request's evidence and be active.
+Repeated detail lookups reuse one snapshot. The model returns schema-constrained
+event/outcome selections; Python inserts all quotes and source links, escapes
+untrusted report text, and publishes only after validation. Resolution comparisons
+and selection notes are model judgments, not independently verified conclusions.
+
+Midpoints use valid two-sided Yes quotes, excluding empty boundary quotes. If a
+midpoint is unavailable, last trade or provider-reported outcome prices are labeled
+explicitly. The report includes bid/ask and platform-specific activity units;
+Kalshi contract counts are not treated as Polymarket dollar volume. Scheduled end
+dates alone do not determine trading status.
+
+```irc
+@config plugins.codex.marketsModel gpt-6.1-terra
+@config plugins.codex.marketsEffort low
+@config plugins.codex.marketsTimeoutSeconds 120
+@config plugins.codex.marketsPublishEnabled True
+```
+
+Markets shares the Codex execution slot, channel allowlist, and user cooldown.
+The model execution deadline is 120 seconds by default; existing wrapper cleanup
+and quota telemetry, plus a bounded 12-second upload, can add to reply latency.
+A source failure is disclosed while surviving results can still be returned.
+If publishing fails, the summary is returned without a link. Reports are retained
+as `markets-<request-id>.md` in the wrapper output directory; they contain the
+explicit query and public market data, never channel history or model traces.
+The model's private request evidence is removed after the command completes.
+
+The uploader follows Newsletter's pasters.io protocol: POST Markdown, require
+HTTP 201, validate the returned HTTPS host/path, and use the `.md` rendering URL.
+It makes one attempt to avoid duplicate pastes after ambiguous network failures.
+No fallback paste hosts are used. Set `marketsPublishEnabled False` for testing
+without public uploads.
+
+Offline tests (run from a writable scratch directory):
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/path/to/limnoria \
+  /path/to/python -m unittest plugins.Codex.test plugins.Codex.test_markets
+```
+
+Standalone integration testing may invoke `scripts/codex_wrapper.py` with
+`--mode markets --context-policy none --markets-request-dir <private-directory>`.
+Use `markets.prompt(query)` as stdin. This returns selections and retains tool
+records for validation; it never publishes or sends IRC messages by itself.

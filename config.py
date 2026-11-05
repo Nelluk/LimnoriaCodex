@@ -84,4 +84,15 @@ conf.registerGlobalValue(
     ),
 )
 
+
+# Markets is independent of codexask's model and context settings.
+conf.registerGlobalValue(Codex, "marketsModel", registry.String(
+    "gpt-6.1-terra", """Model used for market search and selection."""))
+conf.registerGlobalValue(Codex, "marketsEffort", registry.String(
+    "low", """Reasoning effort for Markets; validated by the Codex wrapper."""))
+conf.registerGlobalValue(Codex, "marketsTimeoutSeconds", registry.PositiveInteger(
+    120, """Maximum model execution time for one Markets request."""))
+conf.registerGlobalValue(Codex, "marketsPublishEnabled", registry.Boolean(
+    True, """Publish Markets reports to pasters.io. Disable for offline testing."""))
+
 # vim:set shiftwidth=4 softtabstop=4 expandtab textwidth=79:

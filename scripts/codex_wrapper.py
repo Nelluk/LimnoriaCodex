@@ -17,6 +17,9 @@ import types
 import uuid
 from datetime import datetime, timezone
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import markets as markets_support
+
 
 DEFAULT_TIMEOUT_SECONDS = 90
 TIMEOUT_ENV_VAR = "CODEX_WRAPPER_TIMEOUT"
@@ -28,7 +31,8 @@ CANDIDATES_ENV = "CODEX_WRAPPER_CANDIDATES"
 EXEC_CODEX_HOME_ENV = "CODEX_WRAPPER_EXEC_CODEX_HOME"
 MODE_ASK = "ask"
 MODE_DEEP = "deep"
-ALLOWED_MODES = (MODE_ASK, MODE_DEEP)
+MODE_MARKETS = "markets"
+ALLOWED_MODES = (MODE_ASK, MODE_DEEP, MODE_MARKETS)
 DEFAULT_MODEL = "gpt-6-luna"
 DEFAULT_REASONING_EFFORT = "high"
 ALLOWED_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
@@ -55,6 +59,13 @@ EXEC_DISABLED_FEATURES = (
     "skill_mcp_dependency_install",
 )
 MODE_PRESETS = {
+    MODE_MARKETS: {
+        "model": "gpt-6.1-terra",
+        "reasoning_effort": "low",
+        "web_search": "disabled",
+        "web_search_context_size": None,
+        "markets": True,
+    },
     MODE_ASK: {
         "model": DEFAULT_MODEL,
         "reasoning_effort": DEFAULT_REASONING_EFFORT,
@@ -144,6 +155,8 @@ def _runtime_settings(
         raise RuntimeError(f"unsupported mode: {mode}")
 
     preset = dict(MODE_PRESETS[normalized_mode])
+    if normalized_mode == MODE_MARKETS and web_search_context_size is not None:
+        raise RuntimeError("markets mode does not accept web search overrides")
     if normalized_mode == MODE_DEEP:
         if model is not None or reasoning_effort is not None or web_search_context_size is not None:
             raise RuntimeError("deep mode does not accept model or search overrides")
@@ -336,7 +349,7 @@ def _toml_string(value):
     return json.dumps(str(value), ensure_ascii=True)
 
 
-def _exec_command(codex_binary, settings, layout, output_path):
+def _exec_command(codex_binary, settings, layout, output_path, markets_request_dir=None):
     cmd = [
         codex_binary,
         "exec",
@@ -400,6 +413,25 @@ def _exec_command(codex_binary, settings, layout, output_path):
                 "mcp_servers.soju_history.tool_timeout_sec=35",
             )
         )
+
+    if settings.get("markets"):
+        if not markets_request_dir:
+            raise RuntimeError("markets mode requires a private request directory")
+        schema_path = os.path.join(markets_request_dir, "selection-schema.json")
+        with open(schema_path, "w", encoding="utf-8") as handle:
+            json.dump(markets_support.selection_schema(), handle)
+        tools_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "markets.py")
+        cmd.extend((
+            "--output-schema", schema_path,
+            "-c", f"mcp_servers.markets.command={_toml_string(sys.executable)}",
+            "-c", f"mcp_servers.markets.args=[{_toml_string(tools_path)}]",
+            "-c", 'mcp_servers.markets.env_vars=["CODEX_MARKETS_REQUEST_DIR"]',
+            "-c", "mcp_servers.markets.required=true",
+            "-c", 'mcp_servers.markets.enabled_tools=["search_markets","get_event"]',
+            "-c", 'mcp_servers.markets.default_tools_approval_mode="approve"',
+            "-c", "mcp_servers.markets.startup_timeout_sec=10",
+            "-c", "mcp_servers.markets.tool_timeout_sec=20",
+        ))
 
     context_size = settings.get("web_search_context_size")
     if context_size:
@@ -930,13 +962,13 @@ def main():
     parser.add_argument(
         "--model",
         default=None,
-        help="Codex model identifier for ask mode.",
+        help="Codex model identifier for ask or markets mode.",
     )
     parser.add_argument(
         "--reasoning-effort",
         type=_reasoning_effort_arg,
         default=None,
-        help="Reasoning effort for ask mode.",
+        help="Reasoning effort for ask or markets mode.",
     )
     parser.add_argument(
         "--context-policy",
@@ -960,7 +992,17 @@ def main():
         default=None,
         help="Trusted exclusive UTC history cutoff; required only in deep mode.",
     )
+    parser.add_argument("--markets-request-dir", default=None,
+                        help="Private evidence directory, required only for markets mode.")
     args = parser.parse_args()
+    if args.mode == MODE_MARKETS:
+        if args.context_policy != "none" or not args.markets_request_dir or not os.path.isdir(args.markets_request_dir):
+            print("markets mode requires context none and an existing private request directory", file=sys.stderr)
+            return 2
+        args.markets_request_dir = os.path.abspath(args.markets_request_dir)
+    elif args.markets_request_dir:
+        print("markets request directory is valid only in markets mode", file=sys.stderr)
+        return 2
 
     timeout_seconds = _resolve_timeout(args.timeout)
     if (args.mode == MODE_DEEP) != (args.context_policy == "deep"):
@@ -1028,7 +1070,7 @@ def main():
         ) as handle:
             output_path = handle.name
 
-        cmd = _exec_command(codex_binary, settings, layout, output_path)
+        cmd = _exec_command(codex_binary, settings, layout, output_path, markets_request_dir=args.markets_request_dir)
 
         try:
             child_env = _codex_child_env(
@@ -1039,6 +1081,8 @@ def main():
                 soju_cutoff=soju_cutoff,
                 soju_request_id=telemetry_request_id,
             )
+            if args.mode == MODE_MARKETS:
+                child_env[markets_support.REQUEST_DIR_ENV] = os.path.abspath(args.markets_request_dir)
             _append_debug_line(
                 layout,
                 (
@@ -1133,6 +1177,7 @@ def main():
         if telemetry_started is not None and child_env is not None:
             duration_ms = int((time.monotonic() - telemetry_started) * 1000)
             quota_env = dict(child_env)
+            quota_env.pop(markets_support.REQUEST_DIR_ENV, None)
             quota_env.pop(SOJU_TRANSPORT_CONFIG_ENV, None)
             quota_env.pop(SOJU_CUTOFF_ENV, None)
             quota_env.pop(SOJU_TELEMETRY_PATH_ENV, None)

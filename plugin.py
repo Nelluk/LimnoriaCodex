@@ -10,6 +10,9 @@ import threading
 import time
 import types
 import json
+import tempfile
+import uuid
+from . import markets as markets_support
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
 
@@ -30,6 +33,7 @@ QUOTA_RESET_RE = re.compile(
 BULLET_PREFIX_RE = re.compile(r"^\s*[-*•]\s+")
 MODE_ASK = "ask"
 MODE_DEEP = "deep"
+MODE_MARKETS = "markets"
 CONTEXT_NONE = "none"
 CONTEXT_RECENT = "recent"
 CONTEXT_LONG = "long"
@@ -1053,6 +1057,7 @@ class Codex(callbacks.Plugin):
         web_search_context_size=None,
         soju_transport_config=None,
         soju_cutoff=None,
+        markets_request_dir=None,
     ):
         if mode == MODE_DEEP:
             if not soju_transport_config or not soju_cutoff:
@@ -1068,15 +1073,15 @@ class Codex(callbacks.Plugin):
                     "deep mode does not accept model, effort, or search overrides"
                 )
             context_policy = CONTEXT_DEEP
-        elif mode == MODE_ASK:
+        elif mode in (MODE_ASK, MODE_MARKETS):
             if soju_transport_config or soju_cutoff:
                 raise WrapperExecutionError(
                     "canonical history transport and cutoff are valid only in deep mode"
                 )
             if model is None:
-                model = DEFAULT_MODEL
+                model = "gpt-6.1-terra" if mode == MODE_MARKETS else DEFAULT_MODEL
             if reasoning_effort is None:
-                reasoning_effort = DEFAULT_REASONING_EFFORT
+                reasoning_effort = "low" if mode == MODE_MARKETS else DEFAULT_REASONING_EFFORT
         else:
             raise WrapperExecutionError("unsupported Codex request mode")
 
@@ -1096,6 +1101,13 @@ class Codex(callbacks.Plugin):
         else:
             cmd.extend(["--soju-transport-config", soju_transport_config])
             cmd.extend(["--soju-cutoff", soju_cutoff])
+
+        if mode == MODE_MARKETS:
+            if context_policy != CONTEXT_NONE or not markets_request_dir or web_search_context_size:
+                raise WrapperExecutionError("markets mode requires context none and a private request directory")
+            cmd.extend(("--markets-request-dir", markets_request_dir))
+        elif markets_request_dir:
+            raise WrapperExecutionError("markets evidence directory is valid only in markets mode")
 
         run_env = os.environ.copy()
         run_env["CODEX_WRAPPER_WRITE_BASE"] = runtime_paths["base"]
@@ -1361,6 +1373,80 @@ class Codex(callbacks.Plugin):
 
         nick = self._sanitize_context_text(msg.nick) or msg.nick
         self._append_context_line(context_key, f"{nick}: {text}")
+
+    def _handle_markets_request(self, irc, msg, query):
+        query = (query or "").strip()
+        if not query or len(query) > 500:
+            irc.reply("Usage: @markets <query up to 500 characters>", prefixNick=False)
+            return
+        if not self._is_allowed_channel(irc, msg):
+            irc.reply("This command is not enabled in this channel.", prefixNick=False)
+            return
+        remaining = self._cooldown_remaining(msg)
+        if remaining:
+            irc.reply(f"Please wait {remaining}s before using this command again.", prefixNick=False)
+            return
+        acquired, _ = self._acquire_execution_slot()
+        if not acquired:
+            irc.reply("Codex is busy right now. Please try again shortly.", prefixNick=False)
+            return
+        try:
+            self._mark_cooldown(msg)
+            paths = self._resolve_runtime_write_paths()
+            if not self._is_wrapper_usable(self.WRAPPER_PATH):
+                raise WrapperExecutionError("Codex wrapper is missing or not executable")
+            with tempfile.TemporaryDirectory(prefix="markets-", dir=paths["temp"]) as request_dir:
+                output = self._invoke_wrapper(
+                    self.WRAPPER_PATH, markets_support.prompt(query),
+                    self._safe_int("marketsTimeoutSeconds", minimum=1), paths,
+                    mode=MODE_MARKETS, model=str(self.registryValue("marketsModel")),
+                    reasoning_effort=str(self.registryValue("marketsEffort")),
+                    context_policy=CONTEXT_NONE, markets_request_dir=request_dir,
+                )
+                if len(output) > 30_000:
+                    raise ValueError("Oversized Markets selection")
+                selection = json.loads(output)
+                groups = markets_support.validate_selection(selection, request_dir)
+                coverage_path = os.path.join(request_dir, "searches.json")
+                with open(coverage_path, encoding="utf-8") as handle:
+                    searches = json.load(handle)
+                markets_support.validate_coverage(query, searches)
+                report = markets_support.render(query, selection, groups, searches)
+                report_path = os.path.join(paths["output"], "markets-" + uuid.uuid4().hex + ".md")
+                with open(report_path, "w", encoding="utf-8") as handle:
+                    handle.write(report)
+                suffix = ""
+                failed = builtins.any(item["status"] == "failed" for item in searches)
+                if self.registryValue("marketsPublishEnabled"):
+                    try:
+                        suffix = " | " + markets_support.publish(report)
+                    except Exception:
+                        self.log.warning("Markets report upload failed; local report retained")
+                        suffix = " | Report unavailable"
+                else:
+                    suffix = " | Report publishing disabled"
+                if failed:
+                    suffix = " | Some lookups failed" + suffix
+                if not groups and failed:
+                    irc.reply("No suitable markets selected; source coverage was incomplete." + suffix, prefixNick=False)
+                else:
+                    irc.reply(markets_support.summary(groups, suffix), prefixNick=False)
+        except WrapperTimeoutError:
+            irc.reply("Markets search timed out. Please try a more specific query.", prefixNick=False)
+        except WrapperExecutionError as exc:
+            self.log.warning("Markets model request failed")
+            irc.reply(self._friendly_wrapper_error(exc), prefixNick=False)
+        except Exception:
+            self.log.exception("Markets request failed")
+            irc.reply("Markets could not produce a verified answer. Please try again.", prefixNick=False)
+        finally:
+            self._release_execution_slot()
+
+    def markets(self, irc, msg, args, query):
+        """<query> — Find relevant Polymarket/Kalshi markets and link a detailed report."""
+        self._handle_markets_request(irc, msg, query)
+
+    markets = wrap(markets, ["text"])
 
     def codexask(self, irc, msg, args, prompt):
         """[<options> --] <prompt>
