@@ -307,6 +307,14 @@ headings, and highlights 24-hour moves of at least 5 percentage points with a
 bold quote and directional arrow. It keeps within 400 UTF-8 bytes including the
 report link, dropping whole secondary outcomes before shortening names.
 
+Name matching normalizes accents and punctuation. Paired team markets in the
+same supported league can match a city (or city plus team initial) to a uniquely identified full team name
+using all fetched outcomes. Ambiguous cities and same-event name collisions stay
+separate. Channel comparisons can fill a matching counterpart from the fetched
+event even when the model selected a different set of leaders on that platform.
+Broad league queries are prompted to prioritize season-wide futures and awards;
+individual games require a user-requested game/date/team scope and a verified date.
+
 Reports align both platforms in one table per group, show up to 10 relevant
 outcomes with 24-hour changes, and highlight the same large moves. Source links
 lead to full outcome lists and resolution rules. Raw search traces, repeated

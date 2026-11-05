@@ -182,7 +182,8 @@ class MarketBehaviorTest(unittest.TestCase):
     def test_summary_prunes_whole_outcomes_before_cutting_any_quote(self):
         groups = markets.validate_selection(selection(), self.directory)
         event_record, outcomes = groups[0]["events"][0]
-        outcomes[:] = [{**outcomes[0], "label": "Candidate " + str(i), "change_24h": .1} for i in range(3)]
+        outcomes[:] = [{**outcomes[0], "id": str(i), "label": "Candidate " + str(i), "change_24h": .1} for i in range(3)]
+        event_record["outcomes"] = outcomes
         text = markets.summary(groups, " | https://pasters.io/a.md", max_bytes=135)
         self.assertLessEqual(len(text.encode()), 135)
         self.assertEqual(text.count("\x02") % 2, 0)
@@ -202,6 +203,64 @@ class MarketBehaviorTest(unittest.TestCase):
         # Explicitly selected long-shot outcomes are retained.
         groups[0]["events"] = [(e, [e["outcomes"][-1]])]
         self.assertIn("190+", [label for label, _ in markets.comparison_rows(groups[0]["events"])])
+
+    def sports_event(self, platform, title, labels, selected=None):
+        e = {**event(), "platform": platform, "title": title, "event_id": "test-" + platform}
+        base = e["outcomes"][0]
+        e["outcomes"] = [{**base, "id": platform + str(i), "label": label, "price": .23 - i * .03} for i, label in enumerate(labels)]
+        return e, [e["outcomes"][i] for i in (selected if selected is not None else range(min(3, len(labels))))]
+
+    def test_nba_full_team_names_and_city_names_share_one_row_in_both_source_orders(self):
+        poly = self.sports_event("polymarket", "NBA: 2027 Champion", ["San Antonio Spurs", "Philadelphia 76ers", "Oklahoma City Thunder"])
+        kalshi = self.sports_event("kalshi", "2027 Pro Basketball Champion", ["San Antonio", "Philadelphia", "Oklahoma City"])
+        for events in ([poly, kalshi], [kalshi, poly]):
+            rows = markets.comparison_rows(events, selected_only=True)
+            self.assertEqual(len(rows), 3)
+            self.assertTrue(all(all(o is not None for o in quotes) for _, quotes in rows))
+            self.assertIn("San Antonio Spurs", [label for label, _ in rows])
+            groups = [{"label": "2027 champion", "note": "", "events": events}]
+            text = markets.summary(groups)
+            self.assertEqual(text.count("San Antonio"), 1)
+            self.assertNotIn("/—", text)
+
+    def test_counterpart_is_filled_from_fetched_quotes_even_when_not_selected(self):
+        poly = self.sports_event("polymarket", "NBA Champion", ["San Antonio Spurs", "Philadelphia 76ers"], selected=[0])
+        kalshi = self.sports_event("kalshi", "Pro Basketball Champion", ["San Antonio", "Philadelphia"], selected=[1])
+        rows = markets.comparison_rows([poly, kalshi], selected_only=True)
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(all(o is not None for o in quotes) for _, quotes in rows))
+
+    def test_city_with_multiple_teams_is_not_guessed_from_selected_leaders(self):
+        poly = self.sports_event("polymarket", "NBA Champion", ["Los Angeles Lakers", "Los Angeles Clippers"], selected=[0])
+        kalshi = self.sports_event("kalshi", "Pro Basketball Champion", ["Los Angeles"], selected=[0])
+        rows = markets.comparison_rows([poly, kalshi], selected_only=True)
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(sum(o is not None for o in quotes) == 1 for _, quotes in rows))
+
+    def test_team_initials_disambiguate_city_with_two_teams(self):
+        poly = self.sports_event("polymarket", "NBA Champion", ["Los Angeles Lakers", "Los Angeles Clippers"])
+        kalshi = self.sports_event("kalshi", "Pro Basketball Champion", ["Los Angeles L", "Los Angeles C"])
+        rows = markets.comparison_rows([poly, kalshi], selected_only=True)
+        self.assertEqual(len(rows), 2)
+        for label, quotes in rows:
+            self.assertTrue(all(o is not None for o in quotes))
+            self.assertEqual(quotes[1]["label"], "Los Angeles L" if label.endswith("Lakers") else "Los Angeles C")
+
+    def test_prefix_matching_does_not_apply_to_player_awards_or_unrelated_markets(self):
+        for title in ("NBA MVP", "Election winner"):
+            left = self.sports_event("polymarket", title, ["Nikola Jokic"])
+            right = self.sports_event("kalshi", title, ["Nikola"])
+            self.assertEqual(len(markets.comparison_rows([left, right], selected_only=True)), 2)
+
+    def test_accented_player_names_align_without_collapsing_same_event_contracts(self):
+        left = self.sports_event("polymarket", "NBA MVP", ["Nikola Jokic"])
+        right = self.sports_event("kalshi", "Pro Basketball MVP", ["Nikola Jokić"])
+        rows = markets.comparison_rows([left, right], selected_only=True)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(all(o is not None for o in rows[0][1]))
+        left = self.sports_event("polymarket", "Election", ["José Garcia", "Jose Garcia"])
+        right = self.sports_event("kalshi", "Election", ["Jose Garcia"])
+        self.assertEqual(len(markets.comparison_rows([left, right], selected_only=True)), 3)
 
     def test_upload_requires_201_and_valid_host_and_returns_markdown_link(self):
         class Response(io.BytesIO):

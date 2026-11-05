@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -241,6 +242,13 @@ merge threshold contracts ('at least') into exclusive ranges. Compare resolution
 rules before grouping events as equivalents, and explain material differences.
 Use short explicit labels, e.g. 'Dem nominee', 'GOP nominee', 'House seats'.
 Order groups coherently: overall result, nominees, then legislative control.
+For a bare sport/league query (e.g. NBA), prefer active season-wide markets such
+as championship, major awards, and conference winners. Prefer varied market types
+when they have meaningful trading. Three groups is a maximum,
+not a quota: two strong groups are better than an arbitrary individual fixture.
+Include individual games only when the user asks for games, today/tonight, a date,
+or a specific team. Verify the relevant date from fetched data and include it in
+the game label; do not infer an upcoming fixture from active status alone.
 For equivalent markets, select matching outcomes across platforms where possible.
 Notes should be empty unless there is a material resolution-rule difference or
 uncertainty worth explaining. Do not repeat the title or explain obvious relevance.
@@ -335,7 +343,9 @@ def markdown(value):
 
 
 def outcome_key(label):
-    text = clean(label).casefold().replace("–", "-").replace("—", "-")
+    text = unicodedata.normalize("NFKD", clean(label).casefold())
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    text = text.replace("–", "-").replace("—", "-")
     text = re.sub(r"\s+party$", "", text)
     if text in ("democrat", "democrats", "democratic"):
         return "democratic"
@@ -345,23 +355,98 @@ def outcome_key(label):
     return re.sub(r"[\s.,'’]", "", text)
 
 
+def team_league(event):
+    text = (event.get("title", "") + " " + event.get("event_id", "")).casefold()
+    # City aliases apply to team contests, never player/coach awards or props.
+    if re.search(r"mvp|valuable|player|coach|scorer|points|rebounds|assists|rookie", text):
+        return None
+    for league, pattern in (
+        ("wnba", r"\bwnba\b|\bkxwnba"),
+        ("nba", r"\bnba\b|\bkxnba|pro basketball"),
+        ("nfl", r"\bnfl\b|\bkxnfl|pro football"),
+        ("nhl", r"\bnhl\b|\bkxnhl|pro hockey"),
+        ("mlb", r"\bmlb\b|\bkxmlb|pro baseball"),
+    ):
+        if re.search(pattern, text):
+            return league
+    return None
+
+
+def entity_aliases(events):
+    """Resolve only unique team-name prefixes inside equivalent league events.
+
+    Use the full fetched outcome sets, not just the selected leaders, so a city
+    with multiple teams cannot become spuriously unique after selection.
+    """
+    by_event = []
+    ambiguous = set()
+    for event, _ in events:
+        names = {}
+        for o in available(event):
+            key = outcome_key(o["label"])
+            if key in names and names[key][0] != o["id"]:
+                ambiguous.add(key)
+            folded = "".join(c for c in unicodedata.normalize("NFKD", clean(o["label"]).casefold()) if not unicodedata.combining(c))
+            words = tuple(re.findall(r"[^\W_]+", folded))
+            names[key] = (o["id"], words)
+        by_event.append(names)
+    leagues = [team_league(event) for event, _ in events]
+    aliases = {}
+    if len(events) == 2 and leagues[0] and leagues[0] == leagues[1]:
+        for index, names in enumerate(by_event):
+            other = by_event[1 - index]
+            for key, (_, words) in names.items():
+                # Exact counterparts and same-event collisions take precedence.
+                if not words or key in ambiguous or key in other:
+                    continue
+                matches = [candidate for candidate, (_, full) in other.items()
+                           if candidate not in ambiguous and candidate not in names
+                           and ((len(words) < len(full) and full[:len(words)] == words)
+                                or (len(words) == len(full) and words[:-1] == full[:-1]
+                                    and len(words[-1]) == 1 and full[-1].startswith(words[-1])))]
+                if len(matches) == 1:
+                    aliases[key] = matches[0]
+        # Never collapse two different contracts from the same event into a row.
+        collisions = set()
+        for names in by_event:
+            seen = set()
+            for key in names:
+                resolved = aliases.get(key, key)
+                if resolved in seen:
+                    collisions.add(resolved)
+                seen.add(resolved)
+        aliases = {key: target for key, target in aliases.items() if target not in collisions}
+    return aliases, ambiguous
+
+
 def comparison_rows(events, selected_only=False, limit=10):
     maps, labels, scores, selected_keys = [], {}, {}, []
-    for event, selected in events:
-        outcomes = selected if selected_only else available(event)
+    aliases, ambiguous = entity_aliases(events)
+
+    def resolved_key(index, outcome):
+        key = outcome_key(outcome["label"])
+        if key in ambiguous:
+            return f'{key}:{index}:{outcome["id"]}'
+        return aliases.get(key, key)
+
+    for index, (event, selected) in enumerate(events):
         mapping = {}
-        for o in outcomes:
-            key = outcome_key(o["label"])
+        # Fill a selected entity's counterpart from all fetched quotes even if
+        # the model chose a different set of leaders on the other platform.
+        for o in available(event):
+            key = resolved_key(index, o)
             mapping[key] = o
-            labels.setdefault(key, o["label"])
+            if key not in labels or (key in aliases.values() and len(o["label"]) > len(labels[key])):
+                labels[key] = o["label"]
             scores[key] = max(scores.get(key, -1), o["price"] if o["price"] is not None else -1)
         maps.append(mapping)
         for o in selected:
-            key = outcome_key(o["label"])
+            key = resolved_key(index, o)
             if key not in selected_keys:
                 selected_keys.append(key)
-    keys = selected_keys + [key for key in sorted(scores, key=scores.get, reverse=True) if key not in selected_keys and scores[key] >= .005]
+    keys = selected_keys
     if not selected_only:
+        keys = keys + [key for key in sorted(scores, key=scores.get, reverse=True) if key not in selected_keys and scores[key] >= .005]
         keys = keys[:limit]
         def bracket_order(key):
             label = clean(labels[key]).casefold()
@@ -409,6 +494,8 @@ def render(query, selection, groups, searches):
     if not groups:
         lines += ["No suitable markets selected from the retrieved results.", ""]
     lines += ["24h changes are percentage points. **Bold** marks moves of 5 pp or more.", ""]
+    if any(o is None for group in groups for _, quotes in comparison_rows(group["events"]) for o in quotes):
+        lines += ["— means no safely matched quote.", ""]
     kinds = {o["price_type"] for group in groups for _, quotes in comparison_rows(group["events"]) for o in quotes if o}
     if kinds - {"mid"}:
         lines += ["Prices marked (last) use the last trade; (reported) use the provider's quoted price.", ""]
