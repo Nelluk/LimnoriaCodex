@@ -145,11 +145,80 @@ class MarketBehaviorTest(unittest.TestCase):
         cmd = codex_wrapper._exec_command("codex", settings, {"agent_cwd": self.directory}, "/tmp/final", self.directory)
         joined = " ".join(cmd)
         self.assertIn("--output-schema", cmd)
-        self.assertIn('mcp_servers.markets.enabled_tools=["search_markets","get_event"]', joined)
+        self.assertIn('mcp_servers.markets.enabled_tools=["search_markets","get_event","get_price_history"]', joined)
         self.assertNotIn("mcp_servers.soju_history", joined)
         self.assertIn('features.shell_tool=false', joined)
         with self.assertRaises(RuntimeError):
             codex_wrapper._runtime_settings("markets", web_search_context_size="high")
+
+    def test_search_preview_exposes_uncertainty_without_closed_or_extra_contract_data(self):
+        def market(label, price, closed=False):
+            return {"id": label, "groupItemTitle": label, "active": True, "closed": closed,
+                    "outcomes": ["Yes", "No"], "outcomePrices": [price, 1-price]}
+        previews = markets.search_leaders([market("A", .51), market("B", .49), market("Closed", 1, True)], "polymarket")
+        self.assertEqual(previews, [{"label": "A", "price": .51}, {"label": "B", "price": .49}])
+
+    def test_history_samples_are_past_only_fresh_enough_and_keep_zero_prices(self):
+        self.assertEqual(markets.history_snapshot([(100, 0), (201, .8)], 200, max_age=150)["price"], 0)
+        self.assertIsNone(markets.history_snapshot([(100, .5)], 201, max_age=100))
+        self.assertIsNone(markets.history_snapshot([(201, .8)], 200))
+
+    def test_polymarket_history_keeps_timestamped_samples_and_named_side_tokens(self):
+        as_of = 2_000_000
+        data = {"history": [{"t": as_of + 1, "p": .99}, {"t": as_of - 60, "p": .04},
+                            {"t": as_of - 86400 - 60, "p": .08}, {"t": as_of - 7 * 86400 - 60, "p": .6}]}
+        with mock.patch.object(markets, "fetch", return_value=data) as fetch:
+            result = markets.price_history(self.e, {**self.e["outcomes"][0], "_history_token": "1234"}, as_of)
+        self.assertEqual(result["snapshots"]["latest"]["price"], .04)
+        self.assertEqual(result["snapshots"]["24h_ago"]["price"], .08)
+        self.assertEqual(result["snapshots"]["7d_ago"]["price"], .6)
+        self.assertAlmostEqual(result["sampled_change_24h"], -.04)
+        self.assertAlmostEqual(result["sampled_change_7d"], -.56)
+        self.assertIn("market=1234", fetch.call_args.args[0])
+        self.assertIn("startTs=", fetch.call_args.args[0])
+        named = markets.poly_outcomes({"id": "party", "outcomes": ["D", "R"], "outcomePrices": [.6, .4], "clobTokenIds": '["11", "22"]'})
+        self.assertEqual([o["_history_token"] for o in named], ["11", "22"])
+
+    def test_kalshi_history_uses_one_quote_basis_without_last_trade_filling(self):
+        as_of = 2_000_000
+        def candle(at, bid, ask):
+            return {"end_period_ts": at, "yes_bid": {"close_dollars": bid}, "yes_ask": {"close_dollars": ask}, "price": {"close_dollars": ".9"}}
+        data = {"candlesticks": [candle(as_of - 60, ".03", ".05"),
+                                  candle(as_of - 86400 - 60, None, ".2"),
+                                  candle(as_of - 7 * 86400 - 60, ".59", ".61")]}
+        with mock.patch.object(markets, "fetch", return_value=data):
+            result = markets.price_history({"platform": "kalshi", "series_id": "TEST"}, {"id": "TEST-A", "label": "A"}, as_of)
+        self.assertEqual(result["snapshots"]["latest"]["price"], .04)
+        self.assertIsNone(result["snapshots"]["24h_ago"])
+        self.assertIsNone(result["sampled_change_24h"])
+        self.assertEqual(result["snapshots"]["7d_ago"]["price"], .6)
+        self.assertIn("midpoint", result["basis"])
+
+    def test_history_batches_require_fetched_ids_are_cached_and_have_a_separate_cap(self):
+        server = markets.ToolServer(self.directory)
+        args = {"platform": "polymarket", "event_id": "house-lower", "outcome_ids": ["170"]}
+        point = {"id": "170", "label": "170-174", "snapshots": {"latest": {"price": .47}}, "error": None}
+        with mock.patch.object(markets, "price_history", return_value=point) as lookup:
+            for _ in range(markets.MAX_HISTORY_CALLS):
+                result = server.call("get_price_history", args)
+            self.assertEqual(lookup.call_count, 1)
+            with self.assertRaises(ValueError):
+                server.call("get_price_history", args)
+        self.assertEqual(result["outcomes"][0]["snapshots"]["latest"]["price"], .47)
+        self.assertEqual(server.searches[-1]["operation"], "history")
+        with mock.patch.object(markets, "price_history") as lookup:
+            for ids in (["not-fetched"], ["170"] * 5):
+                with self.assertRaises(ValueError):
+                    markets.ToolServer(self.directory).call("get_price_history", {**args, "outcome_ids": ids})
+            lookup.assert_not_called()
+
+    def test_missing_history_is_explicit_without_fake_zero_or_source_failure(self):
+        server = markets.ToolServer(self.directory)
+        with mock.patch.object(markets, "price_history", side_effect=TimeoutError):
+            result = server.call("get_price_history", {"platform": "polymarket", "event_id": "house-lower", "outcome_ids": ["170"]})
+        self.assertEqual(result["outcomes"][0]["error"], "history_unavailable")
+        self.assertEqual(result["outcomes"][0]["snapshots"], {})
+        self.assertEqual(server.searches[-1]["status"], "history unavailable")
 
     def test_staged_wrapper_keeps_running_plugins_old_contract_until_restart(self):
         for format_name, expected in (("overview", {"irc_summary", "report_markdown"}),
@@ -158,7 +227,10 @@ class MarketBehaviorTest(unittest.TestCase):
             settings["markets_output"] = format_name
             cmd = codex_wrapper._exec_command("codex", settings, {"agent_cwd": self.directory}, "/tmp/final", self.directory)
             schema_path = cmd[cmd.index("--output-schema") + 1]
-            self.assertEqual(set(json.loads(Path(schema_path).read_text())["properties"]), expected)
+            properties = json.loads(Path(schema_path).read_text())["properties"]
+            self.assertEqual(set(properties), expected)
+            if format_name == "overview":
+                self.assertEqual(next(iter(properties)), "report_markdown")
 
     def test_model_prose_is_preserved_without_reconstructing_or_pairing_quotes(self):
         answer = overview()

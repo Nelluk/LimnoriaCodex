@@ -288,11 +288,11 @@ quote summary, and links a Markdown report on pasters.io. Examples:
 
 Markets defaults to `gpt-6.1-terra` with low effort. It uses the explicit query,
 without channel history or persistent memory. Hosted web search is off; a
-read-only MCP server exposes `search_markets` and `get_event`, with at most 12
+read-only MCP server exposes `search_markets`, `get_event`, and `get_price_history`, with at most 16
 calls per request. Both platforms must be searched unless the query explicitly
 names only one. The model has no trading, account, shell, or publishing tools.
 
-The model writes a short IRC overview and a concise Markdown report directly
+The model drafts a substantive Markdown report, then writes its short IRC overview directly
 from fetched details. It recognizes equivalent names, chooses informative
 markets and outcomes, and uses one approximate percentage when venues broadly
 agree. Significant disagreement can be shown as a range or explanation. Platform
@@ -300,22 +300,40 @@ identities and separate quotes appear only when useful. Broad sports queries
 favor varied season-wide markets; supplementary markets should add information.
 
 The channel aims for 150–250 bytes before the report link, with sensible rounding
-and optional arrows/bold for meaningful 24-hour moves. The report usually runs
-100–250 words, with relevant source links, useful context, and small tables when
-helpful. It omits mirrored quote dumps, routine rule boilerplate, raw search
-traces, and negligible outcome tails. Fewer topics are fine.
+and optional arrows/bold for meaningful 24-hour moves. Substantive reports include outcome/market tables and timestamped history for
+important outcomes, plus relevant source links and concise context. Reports have
+no fixed word count; several topics usually need 200–450 words. The model retains
+freedom over selection, labels, grouping, and useful detail. It omits mirrored
+quote dumps, routine rule boilerplate, raw search traces, and negligible tails.
+Fewer topics are fine. Broad election queries prioritize remaining uncertain
+races and informative brackets over near-certain aggregate markets. Before
+returning, the model must check the summary's subjects, direction, dates and
+conditions against the actual contracts and report.
 
 Python checks response shape, size, source-search coverage, and that report links
 came from fetched event records. It sanitizes raw HTML/control characters,
 converts Markdown bold for IRC, enforces the 400-byte channel limit, and publishes
 the report. Prices, identity matching, approximations, and editorial judgments
 are model-written; Python does not reconstruct or independently verify each
-printed figure. There is no separate alignment engine or second model call.
+printed figure. The report is generated first so its facts are available when
+the summary is written. There is no separate alignment engine or second model call.
 
 Provider data preserves quote types, activity units, and 24-hour changes.
 Polymarket uses its native `oneDayPriceChange`; Kalshi compares like-for-like
 quotes with its day-ago fields. Missing changes stay unavailable. Repeated event
 lookups reuse one request snapshot. Scheduled dates alone do not establish closure.
+
+`get_price_history` accepts one fetched event and up to four fetched outcome IDs.
+At most three history batches are permitted, within the total 16-call budget.
+Batches fetch outcomes concurrently with bounded HTTP timeouts and cache results
+for the request. Polymarket supplies sampled token prices; Kalshi uses hourly
+closing bid/ask midpoints without last-trade substitution. The tool selects the
+last observation at or before now, 24 hours ago, and seven days ago, within a
+two-hour tolerance, returning actual timestamps and price basis. Missing or failed
+samples stay unavailable. Sampled changes are computed from those same observations
+so movement descriptions can agree with the history table; native daily changes
+are a labeled fallback. Historical comparisons must use one venue, contract,
+and basis; blended live estimates must not silently become synthetic history.
 
 ```irc
 @config plugins.codex.marketsModel gpt-6.1-terra

@@ -445,7 +445,7 @@ def _exec_command(codex_binary, settings, layout, output_path, markets_request_d
             "-c", f"mcp_servers.markets.args=[{_toml_string(tools_path)}]",
             "-c", 'mcp_servers.markets.env_vars=["CODEX_MARKETS_REQUEST_DIR"]',
             "-c", "mcp_servers.markets.required=true",
-            "-c", 'mcp_servers.markets.enabled_tools=["search_markets","get_event"]',
+            "-c", 'mcp_servers.markets.enabled_tools=["search_markets","get_event","get_price_history"]',
             "-c", 'mcp_servers.markets.default_tools_approval_mode="approve"',
             "-c", "mcp_servers.markets.startup_timeout_sec=10",
             "-c", "mcp_servers.markets.tool_timeout_sec=20",
