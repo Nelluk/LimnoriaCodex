@@ -1406,6 +1406,7 @@ class Codex(callbacks.Plugin):
             with tempfile.TemporaryDirectory(prefix="markets-", dir=paths["temp"]) as request_dir:
                 status = "error"
                 report_id = uuid.uuid4().hex
+                upload_ms = None
                 try:
                     output = self._invoke_wrapper(
                         self.WRAPPER_PATH, markets_support.prompt(query),
@@ -1433,6 +1434,7 @@ class Codex(callbacks.Plugin):
                         handle.write(report)
                     suffix = ""
                     if self.registryValue("marketsPublishEnabled"):
+                        upload_started = time.monotonic()
                         try:
                             remaining = deadline - time.monotonic()
                             if remaining < .25:
@@ -1441,6 +1443,8 @@ class Codex(callbacks.Plugin):
                         except Exception:
                             self.log.warning("Markets report upload failed; local report retained")
                             suffix = " | Report unavailable"
+                        finally:
+                            upload_ms = round((time.monotonic() - upload_started) * 1000)
                     else:
                         suffix = " | Report publishing disabled"
                     if failed:
@@ -1455,6 +1459,8 @@ class Codex(callbacks.Plugin):
                     # This file has the same strict public-field allowlist as the footer.
                     data = markets_support.diagnostic_data(request_dir, model, effort,
                         round((time.monotonic() - started) * 1000), status)
+                    data["elapsed_ms"] = data.pop("report_ready_ms")
+                    data["upload_ms"] = upload_ms
                     diagnostic_path = os.path.join(paths["output"], "markets-diagnostics-" + report_id + ".json")
                     try:
                         fd = os.open(diagnostic_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

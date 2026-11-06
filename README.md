@@ -61,8 +61,8 @@ tables. Nearby quotes are consolidated; material contract differences stay disti
   saved 120-second settings. Six seconds are reserved for shutdown and publishing;
   model execution normally gets 24 seconds. Uploads get at most four seconds from
   the remaining budget. Network/OS cleanup is best effort, not a real-time guarantee.
-- Research has an eight-call ceiling. History is optional, for requested trends or
-  an important move, with at most one batch for two outcomes. Current-outcome
+- Research has an eight-call ceiling. History is optional, only when answering
+  the question requires past prices, with at most one batch for two outcomes. Current-outcome
   tables remain useful without a historical section.
 - `marketsPublishEnabled` controls pasters.io uploads. Publishing failure preserves
   the overview and local report; the bot does not retry an ambiguous upload.
