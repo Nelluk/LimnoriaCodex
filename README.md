@@ -64,7 +64,9 @@ are disabled. Hosted web search remains available for ordinary modes. Deep
 mode disables web search and exposes only seven read-only canonical-history
 tools through a plugin-owned local MCP server and restricted SSH transport.
 
-The current deployment is validated with `codex-cli 0.147.0`.
+GreenCloud uses the standalone CLI at `/home/nelluk/.local/bin/codex`,
+independently of Python SDK packages. Check the installed version with
+`/home/nelluk/.local/bin/codex --version`.
 
 ### systemd deployment
 
