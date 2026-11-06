@@ -91,7 +91,7 @@ conf.registerGlobalValue(Codex, "marketsModel", registry.String(
 conf.registerGlobalValue(Codex, "marketsEffort", registry.String(
     "low", """Reasoning effort for Markets; validated by the Codex wrapper."""))
 conf.registerGlobalValue(Codex, "marketsTimeoutSeconds", registry.PositiveInteger(
-    120, """Maximum model execution time for one Markets request."""))
+    30, """Markets response budget in seconds, capped at 30 including time reserved for publishing."""))
 conf.registerGlobalValue(Codex, "marketsPublishEnabled", registry.Boolean(
     True, """Publish Markets reports to pasters.io. Disable for offline testing."""))
 

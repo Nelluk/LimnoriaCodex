@@ -15,6 +15,7 @@ import tempfile
 import time
 import types
 import uuid
+from pathlib import Path
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -217,7 +218,7 @@ def _read_text_file(path):
         return ""
 
 
-def _run_with_timeout(cmd, input_text, env, timeout_seconds, cwd=None, temp_dir=None):
+def _run_with_timeout(cmd, input_text, env, timeout_seconds, cwd=None, temp_dir=None, kill_grace_seconds=5):
     temp_root = temp_dir or tempfile.gettempdir()
     os.makedirs(temp_root, mode=0o700, exist_ok=True)
     paths = []
@@ -256,7 +257,7 @@ def _run_with_timeout(cmd, input_text, env, timeout_seconds, cwd=None, temp_dir=
             except subprocess.TimeoutExpired as exc:
                 _terminate_process_group(proc.pid)
                 try:
-                    proc.wait(timeout=5)
+                    proc.wait(timeout=kill_grace_seconds)
                 except subprocess.TimeoutExpired:
                     _kill_process_group(proc.pid)
                     proc.wait()
@@ -1133,6 +1134,7 @@ def main():
                 timeout_seconds,
                 cwd=layout["agent_cwd"],
                 temp_dir=layout["temp"],
+                **({"kill_grace_seconds": 1} if args.mode == MODE_MARKETS else {}),
             )
         except subprocess.TimeoutExpired as exc:
             telemetry_stdout = exc.stdout or ""
@@ -1208,7 +1210,7 @@ def main():
             quota_env.pop(SOJU_TELEMETRY_PATH_ENV, None)
             quota_env.pop(SOJU_REQUEST_ID_ENV, None)
             try:
-                quota = _read_quota_snapshot(
+                quota = {"status": "not_collected"} if args.mode == MODE_MARKETS else _read_quota_snapshot(
                     codex_binary,
                     quota_env,
                     layout["agent_cwd"],
@@ -1230,6 +1232,14 @@ def main():
                 "tokens": _turn_usage(telemetry_stdout),
                 "quota": quota,
             }
+            if args.mode == MODE_MARKETS:
+                try:
+                    tool_path = Path(args.markets_request_dir) / "tool-timings.json"
+                    record["market_tools"] = json.loads(tool_path.read_text(encoding="utf-8")) if tool_path.is_file() else []
+                    markets_support.save_json(Path(args.markets_request_dir) / "diagnostics.json",
+                        {"duration_ms": duration_ms, "tokens": record["tokens"]})
+                except (OSError, ValueError):
+                    pass
             if not _append_usage_record(layout, record):
                 _append_debug_line(layout, "usage telemetry write failed")
         if output_path:

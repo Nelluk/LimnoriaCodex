@@ -33,6 +33,51 @@ class MarketBehaviorTest(unittest.TestCase):
         self.e = event()
         markets.save_json(markets.evidence_path(self.directory, "polymarket", "house-lower"), self.e)
 
+    def test_tool_timings_record_slow_failures_without_queries_or_error_text(self):
+        server = markets.ToolServer(self.directory)
+        args = {"platform": "polymarket", "query": "private nick and channel"}
+        with mock.patch.object(markets, "search", side_effect=TimeoutError("secret error /home/person")):
+            with self.assertRaises(TimeoutError):
+                server.call("search_markets", args)
+        rows = json.loads((Path(self.directory) / "tool-timings.json").read_text())
+        self.assertEqual(rows[0]["status"], "error")
+        self.assertGreaterEqual(rows[0]["duration_ms"], 0)
+        self.assertNotIn("private", json.dumps(rows))
+        self.assertNotIn("secret", json.dumps(rows))
+        self.assertNotIn("/home", json.dumps(rows))
+
+    def test_public_diagnostics_allowlist_and_cost_do_not_leak_private_fields(self):
+        markets.save_json(Path(self.directory) / "diagnostics.json", {
+            "duration_ms": 12000, "request_id": "private-id", "query": "private query",
+            "quota": {"plan_type": "private account"},
+            "tokens": {"input_tokens": 100000, "cached_input_tokens": 80000,
+                       "output_tokens": 1000, "reasoning_output_tokens": 200,
+                       "cache_write_input_tokens": 0, "nickname": "private nick"}})
+        markets.save_json(Path(self.directory) / "tool-timings.json", [
+            {"tool": "search_markets", "platform": "polymarket", "status": "success",
+             "duration_ms": 300, "result_count": 4, "response_bytes": 1000,
+             "query": "private query", "error": "/home/private"},
+            {"tool": "<script>private</script>", "platform": "private", "status": "private",
+             "result_count": "private", "duration_ms": "private"}])
+        data = markets.diagnostic_data(self.directory, "gpt-6.1-terra", "low", 12500, "success")
+        footer = markets.diagnostic_footer(data)
+        self.assertNotIn("private", json.dumps(data) + footer)
+        self.assertNotIn("<script>", footer)
+        self.assertIn("<details>", footer)
+        self.assertIn("<summary>Diagnostics</summary>", footer)
+        self.assertIn("$0.0290", footer)  # Reasoning is already in output.
+        self.assertAlmostEqual(markets.api_equivalent(data), .029)
+        data["model"] = "gpt-6-luna"
+        self.assertAlmostEqual(markets.api_equivalent(data), .0033)
+        data["tokens"]["cache_write_input_tokens"] = 10
+        self.assertIsNone(markets.api_equivalent(data))
+
+    def test_absent_or_incomplete_diagnostics_never_invent_zero_cost(self):
+        data = markets.diagnostic_data(self.directory, "custom/private-model", "low", 1000, "success")
+        self.assertEqual(data["model"], "Other model")
+        self.assertIsNone(markets.api_equivalent(data))
+        self.assertIn("Unavailable", markets.diagnostic_footer(data))
+
     def test_midpoint_and_last_are_distinguished_and_bad_quotes_not_averaged(self):
         self.assertEqual(markets.quote_fields(.4, .5, .3)["price"], .45)
         self.assertEqual(markets.quote_fields(.6, .5, .3)["price_type"], "last")
@@ -313,6 +358,32 @@ class MarketsCommandTest(unittest.TestCase):
         self.assertEqual(len(list(Path(self.temp.name).glob("markets-*.md"))), 1)
         self.assertEqual([p for p in Path(self.temp.name).glob("markets-*") if p.is_dir()], [])
         self.assertIn("# House seats", upload.call_args.args[0])
+
+    def test_old_120_second_setting_is_capped_and_upload_gets_remaining_budget(self):
+        run, upload = self.invoke()
+        self.assertLessEqual(run.call_args.args[2], 24)
+        self.assertLessEqual(upload.call_args.kwargs["timeout"], 4)
+        self.assertIn("<summary>Diagnostics</summary>", upload.call_args.args[0])
+        records = list(Path(self.temp.name).glob("markets-diagnostics-*.json"))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].stat().st_mode & 0o777, 0o600)
+        self.assertNotIn("Nelluk", records[0].read_text())
+        self.assertNotIn("##test", records[0].read_text())
+
+    def test_timeout_preserves_inflight_tool_timing_without_publishing(self):
+        from .plugin import WrapperTimeoutError
+        def timeout(*args, **kwargs):
+            directory = Path(kwargs["markets_request_dir"])
+            markets.save_json(directory / "tool-timings.json", [{"tool": "get_event", "platform": "kalshi", "status": "running", "started_ms": 400}])
+            raise WrapperTimeoutError("private error")
+        with mock.patch.object(self.plugin, "_resolve_runtime_write_paths", return_value=self.paths), mock.patch.object(self.plugin, "_invoke_wrapper", side_effect=timeout), mock.patch.object(markets, "publish") as upload:
+            self.plugin._handle_markets_request(self.irc, self.msg, "stephen miller")
+        upload.assert_not_called()
+        self.assertEqual(self.irc.replies[-1], "Markets search timed out. Please try again.")
+        data = json.loads(next(Path(self.temp.name).glob("markets-diagnostics-*.json")).read_text())
+        self.assertEqual(data["status"], "timeout")
+        self.assertEqual(data["tools"][0]["status"], "running")
+        self.assertEqual(self.plugin._active_executions, 0)
 
     def test_new_plugin_explicitly_requests_overview_wire_format(self):
         with mock.patch.object(self.plugin, "_run_child_process", return_value=types.SimpleNamespace(returncode=0, stdout="{}", stderr="")) as run:

@@ -292,7 +292,7 @@ class Codex(callbacks.Plugin):
             except OSError:
                 return
 
-    def _run_child_process(self, cmd, input_text, env, timeout_seconds):
+    def _run_child_process(self, cmd, input_text, env, timeout_seconds, kill_grace_seconds=5):
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -307,7 +307,7 @@ class Codex(callbacks.Plugin):
         except subprocess.TimeoutExpired as exc:
             self._terminate_process_group(proc.pid)
             try:
-                stdout, stderr = proc.communicate(timeout=5)
+                stdout, stderr = proc.communicate(timeout=kill_grace_seconds)
             except subprocess.TimeoutExpired:
                 self._kill_process_group(proc.pid)
                 stdout, stderr = proc.communicate()
@@ -1121,7 +1121,8 @@ class Codex(callbacks.Plugin):
                 cmd,
                 prompt_text,
                 run_env,
-                timeout_seconds + 15,
+                timeout_seconds + (3 if mode == MODE_MARKETS else 15),
+                **({"kill_grace_seconds": 1} if mode == MODE_MARKETS else {}),
             )
         except subprocess.TimeoutExpired as exc:
             raise WrapperTimeoutError("wrapper timeout") from exc
@@ -1390,46 +1391,79 @@ class Codex(callbacks.Plugin):
         if not acquired:
             irc.reply("Codex is busy right now. Please try again shortly.", prefixNick=False)
             return
+        started = time.monotonic()
+        # Reserve six seconds for wrapper shutdown, validation and paste upload.
+        # Cap old saved 120s settings too, so upgrades do not retain the old wait.
+        budget = min(30, self._safe_int("marketsTimeoutSeconds", minimum=1))
+        deadline = started + budget
+        model = str(self.registryValue("marketsModel"))
+        effort = str(self.registryValue("marketsEffort"))
         try:
             self._mark_cooldown(msg)
             paths = self._resolve_runtime_write_paths()
             if not self._is_wrapper_usable(self.WRAPPER_PATH):
                 raise WrapperExecutionError("Codex wrapper is missing or not executable")
             with tempfile.TemporaryDirectory(prefix="markets-", dir=paths["temp"]) as request_dir:
-                output = self._invoke_wrapper(
-                    self.WRAPPER_PATH, markets_support.prompt(query),
-                    self._safe_int("marketsTimeoutSeconds", minimum=1), paths,
-                    mode=MODE_MARKETS, model=str(self.registryValue("marketsModel")),
-                    reasoning_effort=str(self.registryValue("marketsEffort")),
-                    context_policy=CONTEXT_NONE, markets_request_dir=request_dir,
-                )
-                if len(output) > 30_000:
-                    raise ValueError("Oversized Markets output")
-                overview, report = markets_support.validate_output(json.loads(output), request_dir)
-                coverage_path = os.path.join(request_dir, "searches.json")
-                with open(coverage_path, encoding="utf-8") as handle:
-                    searches = json.load(handle)
-                markets_support.validate_coverage(query, searches)
-                failed = builtins.any(item["status"] == "failed" for item in searches)
-                if failed:
-                    report += "\nSome lookups failed; source coverage may be incomplete.\n"
-                report_path = os.path.join(paths["output"], "markets-" + uuid.uuid4().hex + ".md")
-                with open(report_path, "w", encoding="utf-8") as handle:
-                    handle.write(report)
-                suffix = ""
-                if self.registryValue("marketsPublishEnabled"):
+                status = "error"
+                report_id = uuid.uuid4().hex
+                try:
+                    output = self._invoke_wrapper(
+                        self.WRAPPER_PATH, markets_support.prompt(query),
+                        max(1, math.ceil(deadline - time.monotonic() - 6)), paths,
+                        mode=MODE_MARKETS, model=model, reasoning_effort=effort,
+                        context_policy=CONTEXT_NONE, markets_request_dir=request_dir,
+                    )
+                    if time.monotonic() >= deadline:
+                        raise WrapperTimeoutError("Markets deadline reached")
+                    if len(output) > 30_000:
+                        raise ValueError("Oversized Markets output")
+                    overview, report = markets_support.validate_output(json.loads(output), request_dir)
+                    coverage_path = os.path.join(request_dir, "searches.json")
+                    with open(coverage_path, encoding="utf-8") as handle:
+                        searches = json.load(handle)
+                    markets_support.validate_coverage(query, searches)
+                    failed = builtins.any(item["status"] == "failed" for item in searches)
+                    if failed:
+                        report += "\nSome lookups failed; source coverage may be incomplete.\n"
+                    data = markets_support.diagnostic_data(request_dir, model, effort,
+                        round((time.monotonic() - started) * 1000), "success")
+                    report += markets_support.diagnostic_footer(data)
+                    report_path = os.path.join(paths["output"], "markets-" + report_id + ".md")
+                    with open(report_path, "w", encoding="utf-8") as handle:
+                        handle.write(report)
+                    suffix = ""
+                    if self.registryValue("marketsPublishEnabled"):
+                        try:
+                            remaining = deadline - time.monotonic()
+                            if remaining < .25:
+                                raise TimeoutError("No upload budget remains")
+                            suffix = " | " + markets_support.publish(report, timeout=min(4, remaining))
+                        except Exception:
+                            self.log.warning("Markets report upload failed; local report retained")
+                            suffix = " | Report unavailable"
+                    else:
+                        suffix = " | Report publishing disabled"
+                    if failed:
+                        suffix = " | Some lookups failed" + suffix
+                    irc.reply(markets_support.channel_summary(overview, suffix), prefixNick=False)
+                    status = "success"
+                except WrapperTimeoutError:
+                    status = "timeout"
+                    raise
+                finally:
+                    # Preserve running tool entries even when the wrapper is killed.
+                    # This file has the same strict public-field allowlist as the footer.
+                    data = markets_support.diagnostic_data(request_dir, model, effort,
+                        round((time.monotonic() - started) * 1000), status)
+                    diagnostic_path = os.path.join(paths["output"], "markets-diagnostics-" + report_id + ".json")
                     try:
-                        suffix = " | " + markets_support.publish(report)
-                    except Exception:
-                        self.log.warning("Markets report upload failed; local report retained")
-                        suffix = " | Report unavailable"
-                else:
-                    suffix = " | Report publishing disabled"
-                if failed:
-                    suffix = " | Some lookups failed" + suffix
-                irc.reply(markets_support.channel_summary(overview, suffix), prefixNick=False)
+                        fd = os.open(diagnostic_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                            json.dump(data, handle, ensure_ascii=True)
+                    except OSError:
+                        self.log.warning("Markets timing record could not be saved")
         except WrapperTimeoutError:
-            irc.reply("Markets search timed out. Please try a more specific query.", prefixNick=False)
+            irc.reply("Markets search timed out. Please try again.", prefixNick=False)
         except WrapperExecutionError as exc:
             self.log.warning("Markets model request failed")
             irc.reply(self._friendly_wrapper_error(exc), prefixNick=False)
