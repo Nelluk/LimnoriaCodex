@@ -1394,7 +1394,7 @@ class Codex(callbacks.Plugin):
         started = time.monotonic()
         # Reserve six seconds for wrapper shutdown, validation and paste upload.
         # Cap old saved 120s settings too, so upgrades do not retain the old wait.
-        budget = min(30, self._safe_int("marketsTimeoutSeconds", minimum=1))
+        budget = min(40, self._safe_int("marketsTimeoutSeconds", minimum=1))
         deadline = started + budget
         model = str(self.registryValue("marketsModel"))
         effort = str(self.registryValue("marketsEffort"))

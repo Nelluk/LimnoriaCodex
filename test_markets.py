@@ -361,7 +361,8 @@ class MarketsCommandTest(unittest.TestCase):
 
     def test_old_120_second_setting_is_capped_and_upload_gets_remaining_budget(self):
         run, upload = self.invoke()
-        self.assertLessEqual(run.call_args.args[2], 24)
+        self.assertGreater(run.call_args.args[2], 30)
+        self.assertLessEqual(run.call_args.args[2], 34)
         self.assertLessEqual(upload.call_args.kwargs["timeout"], 4)
         self.assertIn("<summary>Diagnostics</summary>", upload.call_args.args[0])
         records = list(Path(self.temp.name).glob("markets-diagnostics-*.json"))

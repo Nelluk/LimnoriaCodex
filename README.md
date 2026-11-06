@@ -57,9 +57,9 @@ by default. It returns a concise overview and links a Markdown report with outco
 tables. Nearby quotes are consolidated; material contract differences stay distinct.
 
 - `marketsModel` and `marketsEffort` select the model independently of `@codexask`.
-- `marketsTimeoutSeconds` defaults to 30 and is capped at 30, including for older
+- `marketsTimeoutSeconds` defaults to 40 and is capped at 40, including for older
   saved 120-second settings. Six seconds are reserved for shutdown and publishing;
-  model execution normally gets 24 seconds. Uploads get at most four seconds from
+  model execution normally gets 34 seconds. Uploads get at most four seconds from
   the remaining budget. Network/OS cleanup is best effort, not a real-time guarantee.
 - Research has an eight-call ceiling. History is optional, only when answering
   the question requires past prices, with at most one batch for two outcomes. Current-outcome
