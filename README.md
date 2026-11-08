@@ -57,10 +57,6 @@ by default. It returns a concise overview and links a Markdown report with outco
 tables. Nearby quotes are consolidated; material contract differences stay distinct.
 Each provider search returns up to 25 candidates for selection; this does not
 change the eight-call research ceiling or require fetching every candidate.
-The model may make one optional related-keyword search when the useful initial
-results are narrow or repetitive and a confident connection could add a distinct
-angle. It skips this when results already provide a varied overview or the query
-is specific, and keeps the extra search within the existing time/tool budget.
 Empty results are silent in IRC. Lookup failures add `Kalshi error` or
 `Polymarket error`; a provider search error disables further searches on that
 provider for the current request, including keyword reformulations.
