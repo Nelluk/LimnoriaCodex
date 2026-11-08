@@ -37,7 +37,7 @@ class MarketBehaviorTest(unittest.TestCase):
         server = markets.ToolServer(self.directory)
         args = {"platform": "polymarket", "query": "private nick and channel"}
         with mock.patch.object(markets, "search", side_effect=TimeoutError("secret error /home/person")):
-            with self.assertRaises(TimeoutError):
+            with self.assertRaises(markets.ProviderSearchError):
                 server.call("search_markets", args)
         rows = json.loads((Path(self.directory) / "tool-timings.json").read_text())
         self.assertEqual(rows[0]["status"], "error")
@@ -134,6 +134,44 @@ class MarketBehaviorTest(unittest.TestCase):
         self.assertIn("%26", fetch.call_args.args[0])
         self.assertTrue(result["more"])
 
+    def test_search_returns_25_candidates_including_late_results_on_both_providers(self):
+        from urllib.parse import parse_qs, urlparse
+        for platform in markets.PLATFORMS:
+            candidates = [{"slug": str(i), "title": str(i), "event_ticker": str(i),
+                           "event_title": str(i), "markets": []} for i in range(30)]
+            response = {"events": candidates, "current_page": candidates}
+            with mock.patch.object(markets, "fetch", return_value=response) as fetch:
+                result = markets.search(platform, "nvidia")
+            self.assertEqual(len(result["candidates"]), 25)
+            self.assertEqual(result["candidates"][24]["event_id"], "24")
+            query = parse_qs(urlparse(fetch.call_args.args[0]).query)
+            self.assertEqual(query["limit_per_type" if platform == "polymarket" else "page_size"], ["25"])
+
+    def test_provider_error_disables_reformulation_but_empty_results_remain_searchable(self):
+        from urllib.error import HTTPError
+        server = markets.ToolServer(self.directory)
+        def request(platform, query, request_id):
+            return server.handle({"id": request_id, "method": "tools/call", "params": {
+                "name": "search_markets", "arguments": {"platform": platform, "query": query}}})["result"]
+        def search(platform, query):
+            if platform == "kalshi":
+                raise HTTPError("https://example.test", 507, "private server error", {}, None)
+            return {"candidates": [], "more": False}
+        with mock.patch.object(markets, "search", side_effect=search) as lookup:
+            first = request("kalshi", "nvidia", 1)
+            second = request("kalshi", "Jensen Huang", 2)
+            self.assertTrue(first["isError"])
+            self.assertTrue(second["isError"])
+            self.assertIn("Do not retry or reformulate", first["content"][0]["text"])
+            self.assertNotIn("private server error", json.dumps(first))
+            self.assertEqual(lookup.call_count, 1)
+            self.assertFalse(request("polymarket", "nvidia", 3)["isError"])
+            self.assertFalse(request("polymarket", "Jensen Huang", 4)["isError"])
+            self.assertEqual(lookup.call_count, 3)
+        rows = json.loads((Path(self.directory) / "tool-timings.json").read_text())
+        self.assertEqual(rows[0]["http_status"], 507)
+        self.assertEqual(server.searches[-1]["status"], "0 candidates")
+
     def test_kalshi_event_uses_nested_or_top_level_markets(self):
         for nested in (True, False):
             e = {"event_ticker": "TEST-28", "series_ticker": "TEST", "title": "Test"}
@@ -176,7 +214,7 @@ class MarketBehaviorTest(unittest.TestCase):
             data = server.call("get_event", {"platform": "polymarket", "event_id": "house-lower"})
         self.assertEqual(len(data["outcomes"]), 1)
         with mock.patch.object(markets, "search", side_effect=TimeoutError):
-            with self.assertRaises(TimeoutError):
+            with self.assertRaises(markets.ProviderSearchError):
                 server.call("search_markets", {"platform": "kalshi", "query": "nominee"})
         coverage = json.loads((Path(self.directory) / "searches.json").read_text())
         self.assertEqual(coverage[-1]["status"], "failed")
@@ -333,12 +371,12 @@ class MarketsCommandTest(unittest.TestCase):
         self.plugin._config.update(marketsModel="gpt-6.1-terra", marketsEffort="low", marketsTimeoutSeconds=120, marketsPublishEnabled=True)
         self.paths = {"base": self.temp.name, "state": self.temp.name, "temp": self.temp.name, "output": self.temp.name}
 
-    def invoke(self, bad=False, publish_error=False, source_failed=False):
+    def invoke(self, bad=False, publish_error=False, source_failed=False, poly_failed=False):
         def wrapper(*args, **kwargs):
             directory = kwargs["markets_request_dir"]
             markets.save_json(markets.evidence_path(directory, "polymarket", "house-lower"), event())
             markets.save_json(Path(directory) / "searches.json", [
-                {"platform": "polymarket", "query": "house seats", "status": "2 candidates"},
+                {"platform": "polymarket", "query": "house seats", "status": "failed" if poly_failed else "2 candidates"},
                 {"platform": "kalshi", "query": "house seats", "status": "failed" if source_failed else "0 candidates"}])
             answer = overview()
             if bad:
@@ -407,8 +445,18 @@ class MarketsCommandTest(unittest.TestCase):
 
     def test_source_failure_is_disclosed_in_report_and_channel(self):
         _, upload = self.invoke(source_failed=True)
-        self.assertIn("Some lookups failed", self.irc.replies[-1])
+        self.assertIn("Kalshi error", self.irc.replies[-1])
+        self.assertNotIn("Some lookups failed", self.irc.replies[-1])
         self.assertIn("source coverage may be incomplete", upload.call_args.args[0])
+
+    def test_empty_provider_search_has_no_irc_error_and_failure_labels_name_each_provider(self):
+        self.invoke()
+        self.assertNotIn("error", self.irc.replies[-1])
+        self.invoke(poly_failed=True)
+        self.assertIn("Polymarket error", self.irc.replies[-1])
+        self.assertNotIn("Kalshi error", self.irc.replies[-1])
+        self.invoke(poly_failed=True, source_failed=True)
+        self.assertIn("Polymarket error | Kalshi error", self.irc.replies[-1])
 
     def test_busy_command_does_not_launch_or_publish(self):
         self.plugin._active_executions = 1

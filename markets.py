@@ -11,10 +11,12 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import urlencode, quote, urlparse
 from urllib.request import Request, urlopen
 
 MAX_CALLS = 8
+SEARCH_LIMIT = 25
 MAX_HISTORY_CALLS = 1
 MAX_HISTORY_OUTCOMES = 2
 MAX_HTTP_BYTES = 8_000_000
@@ -165,19 +167,19 @@ def search(platform, query):
         raise ValueError("Specify a platform and a query of 1–200 characters")
     if platform == "polymarket":
         data = fetch("https://gamma-api.polymarket.com/public-search?" + urlencode({
-            "q": query, "optimized": "true", "limit_per_type": 6, "type": "events",
+            "q": query, "optimized": "true", "limit_per_type": SEARCH_LIMIT, "type": "events",
         }))
         return {"candidates": [{"event_id": e["slug"], "title": e["title"],
                 "closed": e.get("closed"), "end_date": e.get("endDate"),
                 "outcome_count": len(e.get("markets", [])), "leaders": search_leaders(e.get("markets", []), platform)}
-                for e in data.get("events", [])[:6]], "more": bool(data.get("hasMore"))}
+                for e in data.get("events", [])[:SEARCH_LIMIT]], "more": bool(data.get("hasMore"))}
     data = fetch("https://api.elections.kalshi.com/v1/search/series?" + urlencode({
-        "query": query, "order_by": "querymatch", "page_size": 6, "fuzzy_threshold": 4,
+        "query": query, "order_by": "querymatch", "page_size": SEARCH_LIMIT, "fuzzy_threshold": 4,
     }))
     return {"candidates": [{"event_id": e["event_ticker"], "title": e.get("event_title"),
             "series_id": e.get("series_ticker"), "outcome_count": len(e.get("markets", [])),
             "active_markets": e.get("active_market_count"), "leaders": search_leaders(e.get("markets", []), platform)}
-            for e in data.get("current_page", [])[:6] if e.get("event_ticker")],
+            for e in data.get("current_page", [])[:SEARCH_LIMIT] if e.get("event_ticker")],
             "more": bool(data.get("next_cursor"))}
 
 
@@ -549,6 +551,15 @@ TOOLS = [
 ]
 
 
+class ProviderSearchError(RuntimeError):
+    """A failed provider search; changing keywords cannot repair this request."""
+    def __init__(self, platform, cause=None):
+        super().__init__(platform.capitalize() + " search unavailable")
+        self.platform = platform
+        self.code = getattr(cause, "code", None)
+        self.reason = cause if isinstance(cause, TimeoutError) else getattr(cause, "reason", None)
+
+
 class ToolServer:
     def __init__(self, directory):
         self.directory = Path(directory)
@@ -557,6 +568,7 @@ class ToolServer:
         self.calls = 0
         self.history_calls = 0
         self.searches = []
+        self.failed_searches = set()
         self.timings = []
         self.started = time.monotonic()
 
@@ -627,11 +639,19 @@ class ToolServer:
                     "requested_at": datetime.fromtimestamp(as_of, timezone.utc).isoformat(timespec="seconds"),
                     "sampling": "At or before each target, within two hours; null means unavailable.", "outcomes": history}
         if name == "search_markets" and set(args) == {"platform", "query"}:
+            if args["platform"] in self.failed_searches:
+                raise ProviderSearchError(args["platform"])
             item = {**args, "status": "failed"}
             self.searches.append(item)
             try:
                 result = search(**args)
                 item["status"] = f'{len(result["candidates"])} candidates'
+            except Exception as exc:
+                self.failed_searches.add(args["platform"])
+                failure = ProviderSearchError(args["platform"], exc)
+                if isinstance(exc, HTTPError):
+                    exc.close()
+                raise failure from exc
             finally:
                 save_json(self.directory / "searches.json", self.searches)
             return result
@@ -688,8 +708,10 @@ class ToolServer:
             try:
                 data = self.call(params.get("name"), params.get("arguments"))
                 result = {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=True)}, {"type": "text", "text": f'{MAX_CALLS - self.calls} tool calls remain; {time.monotonic() - self.started:.1f}s since market tools started. Finish soon; history is optional.'}], "isError": False}
+            except ProviderSearchError as exc:
+                result = {"content": [{"type": "text", "text": exc.platform.capitalize() + " search failed and is disabled for this request. Do not retry or reformulate searches on this provider. Continue with fetched evidence and the other provider."}], "isError": True}
             except Exception:
-                result = {"content": [{"type": "text", "text": "Market lookup failed or arguments/budget invalid. Try another query/source within the remaining budget."}], "isError": True}
+                result = {"content": [{"type": "text", "text": "Market lookup failed or arguments/budget invalid. Continue with fetched evidence or another source within the remaining budget."}], "isError": True}
         else:
             return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "Unknown method"}}
         return {"jsonrpc": "2.0", "id": request_id, "result": result}

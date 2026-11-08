@@ -1423,7 +1423,8 @@ class Codex(callbacks.Plugin):
                     with open(coverage_path, encoding="utf-8") as handle:
                         searches = json.load(handle)
                     markets_support.validate_coverage(query, searches)
-                    failed = builtins.any(item["status"] == "failed" for item in searches)
+                    failed = [platform for platform in markets_support.PLATFORMS
+                              if builtins.any(item["status"] == "failed" and item["platform"] == platform for item in searches)]
                     if failed:
                         report += "\nSome lookups failed; source coverage may be incomplete.\n"
                     data = markets_support.diagnostic_data(request_dir, model, effort,
@@ -1448,7 +1449,7 @@ class Codex(callbacks.Plugin):
                     else:
                         suffix = " | Report publishing disabled"
                     if failed:
-                        suffix = " | Some lookups failed" + suffix
+                        suffix = " | " + " | ".join(platform.capitalize() + " error" for platform in failed) + suffix
                     irc.reply(markets_support.channel_summary(overview, suffix), prefixNick=False)
                     status = "success"
                 except WrapperTimeoutError:

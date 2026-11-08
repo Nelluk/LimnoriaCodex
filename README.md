@@ -55,6 +55,11 @@ command is therefore available only from Libera `##debate2016`.
 `@markets <topic>` searches Polymarket and Kalshi with `gpt-6.1-terra` / `low`
 by default. It returns a concise overview and links a Markdown report with outcome
 tables. Nearby quotes are consolidated; material contract differences stay distinct.
+Each provider search returns up to 25 candidates for selection; this does not
+change the eight-call research ceiling or require fetching every candidate.
+Empty results are silent in IRC. Lookup failures add `Kalshi error` or
+`Polymarket error`; a provider search error disables further searches on that
+provider for the current request, including keyword reformulations.
 
 - `marketsModel` and `marketsEffort` select the model independently of `@codexask`.
 - `marketsTimeoutSeconds` defaults to 40 and is capped at 40, including for older
