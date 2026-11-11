@@ -659,6 +659,25 @@ class CodexPluginUnitTest(unittest.TestCase):
         reply = self.plugin._prepare_reply_text(output)
         self.assertEqual(reply, "Result (example) more info")
 
+    def test_reply_sanitization_removes_search_citations(self):
+        citation = "\ue200cite\ue202turn0search0\ue202turn0search8\ue201"
+        cases = (
+            ("An answer. " + citation, "An answer."),
+            ("First" + citation + ", then second.", "First, then second."),
+            ("First. " + citation + " Second. " + citation, "First. Second."),
+            (citation, ""),
+            ("Café — 日本語. " + citation, "Café — 日本語."),
+            ("Literal turn0search0 and \ue203.", "Literal turn0search0 and \ue203."),
+        )
+        for output, expected in cases:
+            with self.subTest(output=output):
+                self.assertEqual(self.plugin._prepare_reply_text(output), expected)
+
+    def test_reply_citations_are_removed_before_truncation(self):
+        self.plugin.MAX_REPLY_CHARS = 30
+        output = "First. \ue200cite\ue202turn0search0\ue202turn0search8\ue201 Second."
+        self.assertEqual(self.plugin._prepare_reply_text(output), "First. Second.")
+
     def test_url_only_reply_preserves_first_url(self):
         output = (
             "https://x.com/example/status/12345\n"

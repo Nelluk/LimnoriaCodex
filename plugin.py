@@ -23,6 +23,8 @@ from supybot.commands import *
 
 
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+# Hosted search citations use private-use Unicode delimiters, not IRC controls.
+SEARCH_CITATION_RE = re.compile(r"\ue200cite\ue202[^\ue200\ue201]*\ue201")
 MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
 URL_RE = re.compile(r"https?://\S+")
 QUOTA_RESET_RE = re.compile(
@@ -330,6 +332,7 @@ class Codex(callbacks.Plugin):
     def _sanitize_reply_text(self, text):
         cleaned = ircutils.stripFormatting(text or "")
         cleaned = CONTROL_CHARS_RE.sub("", cleaned)
+        cleaned = SEARCH_CITATION_RE.sub("", cleaned)
         cleaned = MARKDOWN_LINK_RE.sub(r"\1", cleaned)
         cleaned = URL_RE.sub("", cleaned)
         cleaned = cleaned.replace("**", "").replace("__", "").replace("`", "")
